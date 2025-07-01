@@ -25,6 +25,7 @@ import concurrent.futures
 import sys
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
+from code_widget_extractor import CodeWidgetExtractor, create_enhanced_crawler_config
 
 # Add knowledge_graphs folder to path for importing knowledge graph modules
 knowledge_graphs_path = Path(__file__).resolve().parent.parent / 'knowledge_graphs'
@@ -400,16 +401,21 @@ def process_code_example(args):
     return generate_code_example_summary(code, context_before, context_after)
 
 @mcp.tool()
-async def crawl_single_page(ctx: Context, url: str) -> str:
+async def crawl_single_page(ctx: Context, url: str, enable_widget_extraction: bool = True) -> str:
     """
     Crawl a single web page and store its content in Supabase.
     
     This tool is ideal for quickly retrieving content from a specific URL without following links.
     The content is stored in Supabase for later retrieval and querying.
     
+    When enable_widget_extraction is True, the tool uses LLM reasoning to detect interactive 
+    code widgets (tabs, dropdowns, etc.) and automatically extracts all language variants.
+    Perfect for documentation sites like Polygon.io, Stripe, GitHub docs, etc.
+    
     Args:
         ctx: The MCP server provided context
         url: URL of the web page to crawl
+        enable_widget_extraction: Whether to detect and interact with code widgets (default: True)
     
     Returns:
         Summary of the crawling operation and storage in Supabase
@@ -419,11 +425,64 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         
-        # Configure the crawl
-        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+        # Step 1: Initial crawl (always needed)
+        initial_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+        result = await crawler.arun(url=url, config=initial_config)
         
-        # Crawl the page
-        result = await crawler.arun(url=url, config=run_config)
+        if not result.success:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": f"Initial crawl failed: {result.error_message}"
+            }, indent=2)
+        
+        # Step 2: Widget detection and enhanced crawling if enabled
+        extraction_method = "standard"
+        widgets_detected = 0
+        widget_confidence = 0.0
+        widget_types = []
+        languages_found = []
+        
+        if enable_widget_extraction:
+            try:
+                # Analyze for code widgets using LLM
+                widget_extractor = CodeWidgetExtractor()
+                detection_result = await widget_extractor.detect_code_widgets(
+                    result.html or "", 
+                    url
+                )
+                
+                widgets_detected = len(detection_result.widgets_found)
+                widget_confidence = detection_result.confidence_score
+                widget_types = [w.widget_type for w in detection_result.widgets_found]
+                languages_found = list(set([lang for w in detection_result.widgets_found for lang in w.languages]))
+                
+                # Enhanced crawl with widget interaction if widgets found
+                if widgets_detected > 0 and detection_result.confidence_score > 0.2:
+                    print(f"Detected {widgets_detected} code widgets with confidence {detection_result.confidence_score}")
+                    
+                    # Create enhanced crawler config with widget interaction
+                    enhanced_config = create_enhanced_crawler_config(
+                        widget_extractor, 
+                        detection_result.widgets_found
+                    )
+                    
+                    # Re-crawl with widget interactions
+                    enhanced_result = await crawler.arun(url=url, config=enhanced_config)
+                    
+                    if enhanced_result.success:
+                        result = enhanced_result
+                        extraction_method = "enhanced_with_widgets"
+                        print(f"Enhanced crawl successful, extracted {len(enhanced_result.markdown)} chars")
+                    else:
+                        print(f"Enhanced crawl failed, using initial result: {enhanced_result.error_message}")
+                        extraction_method = "fallback_to_initial"
+                else:
+                    print(f"No widgets detected (confidence: {detection_result.confidence_score}), using standard extraction")
+                    
+            except Exception as e:
+                print(f"Widget detection failed: {e}, falling back to standard crawling")
+                extraction_method = "widget_detection_failed"
         
         if result.success and result.markdown:
             # Extract source_id
@@ -450,6 +509,9 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                 meta["chunk_index"] = i
                 meta["url"] = url
                 meta["source"] = source_id
+                meta["extraction_method"] = extraction_method
+                meta["widgets_detected"] = widgets_detected
+                meta["widget_confidence"] = widget_confidence
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
                 metadatas.append(meta)
                 
@@ -469,7 +531,9 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             # Extract and process code examples only if enabled
             extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
             if extract_code_examples:
-                code_blocks = extract_code_blocks(result.markdown)
+                # Use lower min_length threshold for widget-enhanced extraction
+                min_length = 50 if widgets_detected > 0 else 1000
+                code_blocks = extract_code_blocks(result.markdown, min_length=min_length)
                 if code_blocks:
                     code_urls = []
                     code_chunk_numbers = []
@@ -499,7 +563,10 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                             "url": url,
                             "source": source_id,
                             "char_count": len(block['code']),
-                            "word_count": len(block['code'].split())
+                            "word_count": len(block['code'].split()),
+                            "language": block.get('language', ''),
+                            "extraction_method": extraction_method,
+                            "widget_extracted": widgets_detected > 0
                         }
                         code_metadatas.append(code_meta)
                     
@@ -516,6 +583,11 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             return json.dumps({
                 "success": True,
                 "url": url,
+                "extraction_method": extraction_method,
+                "widgets_detected": widgets_detected,
+                "widget_confidence": widget_confidence,
+                "widget_types": widget_types,
+                "languages_found": languages_found,
                 "chunks_stored": len(chunks),
                 "code_examples_stored": len(code_blocks) if code_blocks else 0,
                 "content_length": len(result.markdown),
