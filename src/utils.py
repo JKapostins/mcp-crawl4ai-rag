@@ -442,7 +442,7 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
     Generate a summary for a code example using its surrounding context.
     
     Args:
-        code: The code example
+        code: The code example (may include formatted sections)
         context_before: Context before the code
         context_after: Context after the code
         
@@ -451,8 +451,29 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
     """
     model_choice = os.getenv("MODEL_CHOICE")
     
-    # Create the prompt
-    prompt = f"""<context_before>
+    # Check if this is a structured code example with sections
+    has_code_and_response = "## Code Example" in code and "## Response Object" in code
+    
+    if has_code_and_response:
+        prompt = f"""<context_before>
+{context_before[-500:] if len(context_before) > 500 else context_before}
+</context_before>
+
+<structured_code_example>
+{code[:2000] if len(code) > 2000 else code}
+</structured_code_example>
+
+<context_after>
+{context_after[:500] if len(context_after) > 500 else context_after}
+</context_after>
+
+This is a structured code example that contains both implementation code and a sample response. Provide a concise summary (2-3 sentences) that describes:
+1. What the code implementation does
+2. What the response object represents
+Focus on the practical application and the relationship between the request and response.
+"""
+    else:
+        prompt = f"""<context_before>
 {context_before[-500:] if len(context_before) > 500 else context_before}
 </context_before>
 

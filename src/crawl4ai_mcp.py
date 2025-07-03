@@ -401,21 +401,19 @@ def process_code_example(args):
     return generate_code_example_summary(code, context_before, context_after)
 
 @mcp.tool()
-async def crawl_single_page(ctx: Context, url: str, enable_widget_extraction: bool = True) -> str:
+async def crawl_single_page(ctx: Context, url: str) -> str:
     """
     Crawl a single web page and store its content in Supabase.
     
     This tool is ideal for quickly retrieving content from a specific URL without following links.
     The content is stored in Supabase for later retrieval and querying.
     
-    When enable_widget_extraction is True, the tool uses LLM reasoning to detect interactive 
-    code widgets (tabs, dropdowns, etc.) and automatically extracts all language variants.
-    Perfect for documentation sites like Polygon.io, Stripe, GitHub docs, etc.
+    For extracting code examples from interactive widgets, use the extract_code_widgets tool
+    after running this tool on the same URL.
     
     Args:
         ctx: The MCP server provided context
         url: URL of the web page to crawl
-        enable_widget_extraction: Whether to detect and interact with code widgets (default: True)
     
     Returns:
         Summary of the crawling operation and storage in Supabase
@@ -425,64 +423,11 @@ async def crawl_single_page(ctx: Context, url: str, enable_widget_extraction: bo
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         
-        # Step 1: Initial crawl (always needed)
-        initial_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
-        result = await crawler.arun(url=url, config=initial_config)
+        # Configure the crawl
+        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
         
-        if not result.success:
-            return json.dumps({
-                "success": False,
-                "url": url,
-                "error": f"Initial crawl failed: {result.error_message}"
-            }, indent=2)
-        
-        # Step 2: Widget detection and enhanced crawling if enabled
-        extraction_method = "standard"
-        widgets_detected = 0
-        widget_confidence = 0.0
-        widget_types = []
-        languages_found = []
-        
-        if enable_widget_extraction:
-            try:
-                # Analyze for code widgets using LLM
-                widget_extractor = CodeWidgetExtractor()
-                detection_result = await widget_extractor.detect_code_widgets(
-                    result.html or "", 
-                    url
-                )
-                
-                widgets_detected = len(detection_result.widgets_found)
-                widget_confidence = detection_result.confidence_score
-                widget_types = [w.widget_type for w in detection_result.widgets_found]
-                languages_found = list(set([lang for w in detection_result.widgets_found for lang in w.languages]))
-                
-                # Enhanced crawl with widget interaction if widgets found
-                if widgets_detected > 0 and detection_result.confidence_score > 0.2:
-                    print(f"Detected {widgets_detected} code widgets with confidence {detection_result.confidence_score}")
-                    
-                    # Create enhanced crawler config with widget interaction
-                    enhanced_config = create_enhanced_crawler_config(
-                        widget_extractor, 
-                        detection_result.widgets_found
-                    )
-                    
-                    # Re-crawl with widget interactions
-                    enhanced_result = await crawler.arun(url=url, config=enhanced_config)
-                    
-                    if enhanced_result.success:
-                        result = enhanced_result
-                        extraction_method = "enhanced_with_widgets"
-                        print(f"Enhanced crawl successful, extracted {len(enhanced_result.markdown)} chars")
-                    else:
-                        print(f"Enhanced crawl failed, using initial result: {enhanced_result.error_message}")
-                        extraction_method = "fallback_to_initial"
-                else:
-                    print(f"No widgets detected (confidence: {detection_result.confidence_score}), using standard extraction")
-                    
-            except Exception as e:
-                print(f"Widget detection failed: {e}, falling back to standard crawling")
-                extraction_method = "widget_detection_failed"
+        # Crawl the page
+        result = await crawler.arun(url=url, config=run_config)
         
         if result.success and result.markdown:
             # Extract source_id
@@ -509,9 +454,6 @@ async def crawl_single_page(ctx: Context, url: str, enable_widget_extraction: bo
                 meta["chunk_index"] = i
                 meta["url"] = url
                 meta["source"] = source_id
-                meta["extraction_method"] = extraction_method
-                meta["widgets_detected"] = widgets_detected
-                meta["widget_confidence"] = widget_confidence
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
                 metadatas.append(meta)
                 
@@ -531,9 +473,7 @@ async def crawl_single_page(ctx: Context, url: str, enable_widget_extraction: bo
             # Extract and process code examples only if enabled
             extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
             if extract_code_examples:
-                # Use lower min_length threshold for widget-enhanced extraction
-                min_length = 50 if widgets_detected > 0 else 1000
-                code_blocks = extract_code_blocks(result.markdown, min_length=min_length)
+                code_blocks = extract_code_blocks(result.markdown)
                 if code_blocks:
                     code_urls = []
                     code_chunk_numbers = []
@@ -565,8 +505,7 @@ async def crawl_single_page(ctx: Context, url: str, enable_widget_extraction: bo
                             "char_count": len(block['code']),
                             "word_count": len(block['code'].split()),
                             "language": block.get('language', ''),
-                            "extraction_method": extraction_method,
-                            "widget_extracted": widgets_detected > 0
+                            "extraction_method": "standard_crawl"
                         }
                         code_metadatas.append(code_meta)
                     
@@ -583,11 +522,6 @@ async def crawl_single_page(ctx: Context, url: str, enable_widget_extraction: bo
             return json.dumps({
                 "success": True,
                 "url": url,
-                "extraction_method": extraction_method,
-                "widgets_detected": widgets_detected,
-                "widget_confidence": widget_confidence,
-                "widget_types": widget_types,
-                "languages_found": languages_found,
                 "chunks_stored": len(chunks),
                 "code_examples_stored": len(code_blocks) if code_blocks else 0,
                 "content_length": len(result.markdown),
@@ -1833,6 +1767,380 @@ async def parse_github_repository(ctx: Context, repo_url: str) -> str:
             "repo_url": repo_url,
             "error": f"Repository parsing failed: {str(e)}"
         }, indent=2)
+
+@mcp.tool()
+async def extract_code_widgets(ctx: Context, url: str, languages: str = "python,javascript,shell,go,kotlin") -> str:
+    """
+    Extract code examples from interactive widgets on a documentation page.
+    
+    This tool should be called AFTER crawl_single_page has been run on the same URL
+    to ensure the source exists in the database. It uses LLM reasoning to detect 
+    interactive code widgets (tabs, dropdowns, etc.) and extracts code examples
+    for the specified programming languages.
+    
+    Perfect for documentation sites like Polygon.io, Stripe, GitHub docs, etc.
+    that have interactive code examples in multiple languages.
+    
+    Args:
+        ctx: The MCP server provided context
+        url: URL of the documentation page with code widgets
+        languages: Comma-separated list of languages to extract (e.g., "python,go" or "javascript,shell,kotlin")
+    
+    Returns:
+        JSON string with extraction results and storage summary
+    """
+    try:
+        # Get the crawler from the context
+        crawler = ctx.request_context.lifespan_context.crawler
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        # Parse languages list
+        target_language_list = [lang.strip().lower() for lang in languages.split(',') if lang.strip()]
+        
+        if not target_language_list:
+            return json.dumps({
+                "success": False,
+                "error": "No languages specified"
+            }, indent=2)
+        
+        print(f"🎯 Extracting code widgets for languages: {target_language_list}")
+        
+        # Step 1: Initial crawl to get HTML for widget detection
+        initial_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+        result = await crawler.arun(url=url, config=initial_config)
+        
+        if not result.success:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": f"Failed to crawl page: {result.error_message}"
+            }, indent=2)
+        
+        # Step 2: Detect code widgets using LLM
+        print("🔍 Detecting code widgets...")
+        widget_extractor = CodeWidgetExtractor()
+        detection_result = await widget_extractor.detect_code_widgets(
+            result.html or "", 
+            url
+        )
+        
+        widgets_detected = len(detection_result.widgets_found)
+        widget_confidence = detection_result.confidence_score
+        
+        if widgets_detected == 0:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": "No interactive code widgets detected on this page",
+                "confidence_score": widget_confidence,
+                "suggestion": "This page may not have interactive code examples, or they may be in a format not yet supported"
+            }, indent=2)
+        
+        if widget_confidence < 0.2:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": f"Low confidence in widget detection (score: {widget_confidence})",
+                "widgets_detected": widgets_detected,
+                "suggestion": "The detected widgets may not be reliable. Try a different page or contact support."
+            }, indent=2)
+        
+        print(f"✅ Detected {widgets_detected} widgets with confidence {widget_confidence}")
+        
+        # Step 3: Enhanced crawl with language-specific widget interaction
+        print(f"🚀 Enhanced crawl targeting: {', '.join(target_language_list)}")
+        
+        enhanced_config = create_enhanced_crawler_config(
+            widget_extractor, 
+            detection_result.widgets_found,
+            target_language_list
+        )
+        
+        enhanced_result = await crawler.arun(url=url, config=enhanced_config)
+        
+        if not enhanced_result.success:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": f"Enhanced crawl failed: {enhanced_result.error_message}",
+                "widgets_detected": widgets_detected,
+                "fallback_available": False
+            }, indent=2)
+        
+        print(f"✅ Enhanced crawl successful: {len(enhanced_result.markdown)} chars")
+        
+        # Step 4: Extract code blocks with lower threshold for widget content
+        code_blocks = extract_code_blocks(enhanced_result.markdown, min_length=50)
+        
+        if not code_blocks:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": "No code examples found after widget interaction",
+                "widgets_detected": widgets_detected,
+                "confidence_score": widget_confidence,
+                "content_length": len(enhanced_result.markdown)
+            }, indent=2)
+        
+        print(f"📦 Found {len(code_blocks)} code blocks")
+        
+        # Step 5: Filter and prepare code examples for target languages
+        filtered_blocks = []
+        seen_code_hashes = set()  # Track duplicates
+        
+        for block in code_blocks:
+            code_content = block['code'].lower()
+            block_language = block.get('language', '').lower()
+            
+            # Clean up the code by removing our injection markers and UI text
+            clean_code = block['code']
+            
+            # Remove our extraction markers
+            if "EXTRACTED: " in clean_code:
+                lines = clean_code.split('\n')
+                clean_lines = []
+                skip_until_code = False
+                
+                for line in lines:
+                    if line.strip().startswith("EXTRACTED:"):
+                        skip_until_code = True
+                        continue
+                    elif skip_until_code and (line.strip().startswith("Language:") or line.strip() == ""):
+                        continue
+                    else:
+                        skip_until_code = False
+                        clean_lines.append(line)
+                
+                clean_code = '\n'.join(clean_lines)
+            
+            # Remove UI text pollution at the start
+            if clean_code.startswith('ShellPythonGoJavaScriptKotlin'):
+                clean_code = clean_code[len('ShellPythonGoJavaScriptKotlin'):]
+            if clean_code.startswith('PythonCopied'):
+                clean_code = clean_code[len('PythonCopied'):]
+            
+            clean_code = clean_code.strip()
+            
+            # Create a hash for deduplication (first 200 chars)
+            code_hash = hash(clean_code[:200])
+            if code_hash in seen_code_hashes:
+                print(f"  🔄 Skipping duplicate code block")
+                continue
+            
+            seen_code_hashes.add(code_hash)
+            
+            # Intelligently separate code from response objects
+            formatted_code = clean_code
+            
+            # Check if this contains both code and JSON response
+            if '{' in clean_code and ('"ev"' in clean_code or '"fmv"' in clean_code or '"sym"' in clean_code):
+                # Split into code section and response section
+                lines = clean_code.split('\n')
+                code_lines = []
+                response_lines = []
+                in_json = False
+                json_brace_count = 0
+                
+                for line in lines:
+                    stripped = line.strip()
+                    
+                    # Detect start of JSON (starts with { and contains typical response fields)
+                    if stripped.startswith('{') and not in_json:
+                        # Check if this looks like a response object
+                        next_few_lines = '\n'.join(lines[lines.index(line):lines.index(line)+5] if lines.index(line)+5 < len(lines) else lines[lines.index(line):])
+                        if any(field in next_few_lines for field in ['"ev"', '"fmv"', '"sym"', '"timestamp"', '"response"']):
+                            in_json = True
+                            json_brace_count = 1
+                            response_lines.append(line)
+                            continue
+                    
+                    if in_json:
+                        response_lines.append(line)
+                        json_brace_count += line.count('{') - line.count('}')
+                        if json_brace_count <= 0:
+                            in_json = False
+                    else:
+                        # Skip empty lines at the end of code section
+                        if stripped or code_lines:
+                            code_lines.append(line)
+                
+                # Clean up trailing empty lines from code
+                while code_lines and not code_lines[-1].strip():
+                    code_lines.pop()
+                
+                # Format the content with proper sections
+                if code_lines and response_lines:
+                    python_code = '\n'.join(code_lines)
+                    json_response = '\n'.join(response_lines)
+                    
+                    formatted_code = f"""## Code Example
+
+```python
+{python_code}
+```
+
+## Response Object
+
+```json
+{json_response}
+```"""
+                    
+                    print(f"  📝 Split into code ({len(python_code)} chars) + response ({len(json_response)} chars)")
+            
+            # Update the block with formatted code
+            block['code'] = formatted_code
+            code_content = formatted_code.lower()
+            
+            # Enhanced language detection with smart filtering
+            language_match = None
+            for target_lang in target_language_list:
+                if target_lang == block_language:
+                    language_match = target_lang
+                    break
+                elif target_lang == 'python':
+                    # Check for Python indicators
+                    has_python = any(indicator in code_content for indicator in ['import ', 'def ', 'print(', 'from '])
+                    
+                    if has_python:
+                        # Check if it's actually Kotlin disguised (package statement + kotlin-specific syntax)
+                        has_kotlin_package = 'package io.polygon.kotlin' in code_content or 'suspend fun' in code_content
+                        
+                        # Check if it's UI text pollution (language list at start)
+                        starts_with_ui_text = code_content.startswith('shellpythongojava') or code_content.startswith('shell\npython\ngo')
+                        
+                        if not has_kotlin_package:
+                            language_match = target_lang
+                            break
+                elif target_lang == 'javascript':
+                    has_js = any(indicator in code_content for indicator in ['function', 'const ', 'let ', 'var ', 'console.log', 'import {'])
+                    # Exclude if it has Python-style imports without JS syntax
+                    has_python_imports = 'from polygon import' in code_content
+                    
+                    if has_js and not has_python_imports:
+                        language_match = target_lang
+                        break
+                elif target_lang == 'shell' and any(indicator in code_content for indicator in ['curl ', 'wget ', '#!/bin/bash', '$ ']):
+                    language_match = target_lang
+                    break
+                elif target_lang == 'go':
+                    has_go = any(indicator in code_content for indicator in ['package ', 'func ', 'fmt.'])
+                    # Make sure it's not Python or Kotlin
+                    has_python_syntax = 'from ' in code_content and 'import ' in code_content
+                    has_kotlin_syntax = 'suspend fun' in code_content
+                    
+                    if has_go and not has_python_syntax and not has_kotlin_syntax:
+                        language_match = target_lang
+                        break
+                elif target_lang == 'kotlin':
+                    has_kotlin = any(indicator in code_content for indicator in ['suspend fun', 'kotlinx', 'package io.polygon.kotlin'])
+                    
+                    if has_kotlin:
+                        language_match = target_lang
+                        break
+            
+            if language_match:
+                block['detected_language'] = language_match
+                filtered_blocks.append(block)
+        
+        if not filtered_blocks:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": f"No code examples found for target languages: {', '.join(target_language_list)}",
+                "total_code_blocks": len(code_blocks),
+                "target_languages": target_language_list,
+                "suggestion": "Try different languages or check if the page has examples in the requested languages"
+            }, indent=2)
+        
+        print(f"🎯 Filtered to {len(filtered_blocks)} blocks for target languages")
+        
+        # Step 6: Prepare data for storage
+        parsed_url = urlparse(url)
+        source_id = parsed_url.netloc or parsed_url.path
+        
+        code_urls = []
+        code_chunk_numbers = []
+        code_examples = []
+        code_summaries = []
+        code_metadatas = []
+        
+        # Process code examples in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            summary_args = [(block['code'], block['context_before'], block['context_after']) 
+                            for block in filtered_blocks]
+            summaries = list(executor.map(process_code_example, summary_args))
+        
+        # Prepare code example data
+        for i, (block, summary) in enumerate(zip(filtered_blocks, summaries)):
+            code_urls.append(url)
+            code_chunk_numbers.append(i)
+            code_examples.append(block['code'])
+            code_summaries.append(summary)
+            
+            code_meta = {
+                "chunk_index": i,
+                "url": url,
+                "source": source_id,
+                "char_count": len(block['code']),
+                "word_count": len(block['code'].split()),
+                "language": block['detected_language'],
+                "extraction_method": "widget_interaction",
+                "widget_extracted": True,
+                "target_languages": target_language_list,
+                "widget_confidence": widget_confidence
+            }
+            code_metadatas.append(code_meta)
+        
+        # Step 7: Store in Supabase
+        print(f"💾 Storing {len(filtered_blocks)} code examples...")
+        
+        add_code_examples_to_supabase(
+            supabase_client, 
+            code_urls, 
+            code_chunk_numbers, 
+            code_examples, 
+            code_summaries, 
+            code_metadatas
+        )
+        
+        # Step 8: Verify storage and return results
+        await asyncio.sleep(1)  # Brief wait for database consistency
+        
+        recent_codes = supabase_client.table('code_examples').select('*').eq('source_id', source_id).ilike('metadata->>extraction_method', 'widget_interaction').execute()
+        stored_count = len(recent_codes.data) if recent_codes.data else 0
+        
+        # Summary by language
+        language_summary = {}
+        for block in filtered_blocks:
+            lang = block['detected_language']
+            if lang not in language_summary:
+                language_summary[lang] = []
+            language_summary[lang].append({
+                "length": len(block['code']),
+                "preview": block['code'][:100].replace('\n', ' ') + ("..." if len(block['code']) > 100 else "")
+            })
+        
+        return json.dumps({
+            "success": True,
+            "url": url,
+            "widgets_detected": widgets_detected,
+            "widget_confidence": widget_confidence,
+            "target_languages": target_language_list,
+            "code_examples_extracted": len(filtered_blocks),
+            "code_examples_stored": stored_count,
+            "total_characters": sum(len(block['code']) for block in filtered_blocks),
+            "language_breakdown": language_summary,
+            "extraction_method": "widget_interaction",
+            "source_id": source_id
+        }, indent=2)
+        
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "url": url,
+            "error": str(e)
+        }, indent=2)
+
 
 async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
     """

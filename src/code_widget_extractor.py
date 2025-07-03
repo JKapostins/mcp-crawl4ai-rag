@@ -255,9 +255,13 @@ If no widgets are detected, return confidence 0.0 and empty widgets_found array.
             extraction_strategy="Fallback heuristic detection"
         )
     
-    def generate_extraction_javascript(self, widgets: List[CodeWidget]) -> str:
+    def generate_extraction_javascript(self, widgets: List[CodeWidget], target_languages: List[str] = None) -> str:
         """
         Generate JavaScript code to interact with detected widgets and extract all content.
+        
+        Args:
+            widgets: List of detected code widgets
+            target_languages: List of languages to prioritize for extraction (e.g., ['python', 'javascript'])
         """
         
         js_code_parts = [
@@ -269,6 +273,20 @@ If no widgets are detected, return confidence 0.0 and empty widgets_found array.
             ""
         ]
         
+        # Set up target languages (use provided or default)
+        if target_languages is None:
+            target_languages = ['python', 'javascript', 'shell', 'go', 'kotlin']
+        
+        # Convert to lowercase for matching
+        priority_langs = [lang.lower().strip() for lang in target_languages]
+        
+        js_code_parts.extend([
+            f"// Target languages (in priority order): {', '.join(priority_langs)}",
+            f"const targetLanguages = {priority_langs};",
+            "console.log('Prioritizing languages:', targetLanguages);",
+            ""
+        ])
+        
         for i, widget in enumerate(widgets):
             js_code_parts.extend([
                 f"// Extract widget {i+1}: {widget.title}",
@@ -277,19 +295,43 @@ If no widgets are detected, return confidence 0.0 and empty widgets_found array.
             ])
             
             if widget.widget_type == "tabs":
-                js_code_parts.extend(self._generate_tab_extraction_js(widget))
+                js_code_parts.extend(self._generate_tab_extraction_js(widget, priority_langs))
             elif widget.widget_type == "dropdown":
-                js_code_parts.extend(self._generate_dropdown_extraction_js(widget))
+                js_code_parts.extend(self._generate_dropdown_extraction_js(widget, priority_langs))
             else:
-                js_code_parts.extend(self._generate_generic_extraction_js(widget))
+                js_code_parts.extend(self._generate_generic_extraction_js(widget, priority_langs))
             
             js_code_parts.append("")
         
-        # Add final wait and completion marker
+        # Add final comprehensive extraction
+        lang_pattern = '|'.join(self.common_patterns['language_indicators'])
         js_code_parts.extend([
-            "// Final wait for all content to load",
-            "await new Promise(r => setTimeout(r, 1000));",
-            "console.log('Code widget extraction completed');",
+            "// Final comprehensive extraction - click all tabs quickly to load all content",
+            "console.log('Starting final comprehensive extraction...');",
+            "",
+            "const allLanguageTabs = document.querySelectorAll(",
+            "    'button[data-language], button[aria-controls*=\"code\"], button[role=\"tab\"], .tab'",
+            ");",
+            "",
+            "for (let tab of allLanguageTabs) {",
+            "    const text = (tab.textContent || tab.innerText || '').trim().toLowerCase();",
+            "    const dataLang = tab.getAttribute('data-language') || '';",
+            "    ",
+            f"    if (/({lang_pattern})/i.test(text) || /({lang_pattern})/i.test(dataLang)) {{",
+            "        console.log(`Final click: ${text} (${dataLang})`);",
+            "        try {",
+            "            tab.click();",
+            "            await new Promise(r => setTimeout(r, 300)); // Quick clicks",
+            "        } catch (e) {",
+            "            console.log(`Error in final click: ${e}`);",
+            "        }",
+            "    }",
+            "}",
+            "",
+            "// Wait for all content to settle",
+            "await new Promise(r => setTimeout(r, 2000));",
+            "",
+            "console.log('Widget extraction completed');",
             "",
             "// Mark extraction as complete",
             "window.codeWidgetExtractionComplete = true;"
@@ -297,45 +339,181 @@ If no widgets are detected, return confidence 0.0 and empty widgets_found array.
         
         return "\n".join(js_code_parts)
     
-    def _generate_tab_extraction_js(self, widget: CodeWidget) -> List[str]:
-        """Generate JavaScript for tab-based widgets."""
+    def _generate_tab_extraction_js(self, widget: CodeWidget, priority_langs: List[str] = None) -> List[str]:
+        """Generate JavaScript for tab-based widgets with language prioritization."""
         
-        js_lines = []
+        # Create language pattern for regex
+        lang_pattern = '|'.join(self.common_patterns['language_indicators'])
         
-        # Try multiple selector strategies
-        tab_selectors = list(set([
-            *widget.selectors.values(),
-            *self.common_patterns["tab_selectors"]
-        ]))
-        
-        for selector in tab_selectors[:3]:  # Try top 3 selectors
-            js_lines.extend([
-                f"// Try selector: {selector}",
-                f"try {{",
-                f"    const tabs = document.querySelectorAll('{selector}');",
-                f"    if (tabs.length > 0) {{",
-                f"        console.log(`Found ${{tabs.length}} tabs with selector {selector}`);",
-                f"        for (let tab of tabs) {{",
-                f"            // Check if this looks like a language tab",
-                f"            const tabText = tab.textContent || tab.innerText || '';",
-                f"            const hasLangName = /{'/'.join(self.common_patterns['language_indicators'])}/i.test(tabText);",
-                f"            if (hasLangName) {{",
-                f"                console.log(`Clicking tab: ${{tabText}}`);",
-                f"                tab.click();",
-                f"                await new Promise(r => setTimeout(r, 500));",
-                f"            }}",
-                f"        }}",
-                f"    }}",
-                f"}} catch (e) {{",
-                f"    console.log(`Error with selector {selector}:`, e);",
-                f"}}",
+        # Build prioritized language clicking logic with aggressive search
+        priority_js = []
+        if priority_langs:
+            priority_js.extend([
+                "// AGGRESSIVE language tab clicking strategy",
+                "for (let targetLang of targetLanguages) {",
+                "    console.log(`🎯 Looking for ${targetLang} tab/button...`);",
+                "    let foundTarget = false;",
+                "    ",
+                "    // Strategy 1: Look for ANY element containing the language name",
+                "    const allElements = document.querySelectorAll('*');",
+                "    for (let element of allElements) {",
+                "        const text = (element.textContent || element.innerText || '').trim().toLowerCase();",
+                "        const tagName = element.tagName.toLowerCase();",
+                "        ",
+                "        // Check if element contains target language and is likely clickable",
+                "        if (text === targetLang || text === targetLang.toUpperCase() || ",
+                "            (text.length <= 20 && text.includes(targetLang))) {",
+                "            ",
+                "            // Check if it's a clickable element",
+                "            const isClickable = tagName === 'button' || tagName === 'a' ||",
+                "                               element.onclick || element.getAttribute('onclick') ||",
+                "                               element.style.cursor === 'pointer' ||",
+                "                               element.getAttribute('role') === 'button' ||",
+                "                               element.classList.contains('btn') ||",
+                "                               element.classList.contains('tab') ||",
+                "                               element.classList.contains('clickable');",
+                "            ",
+                "            if (isClickable) {",
+                "                console.log(`📍 Found ${targetLang} clickable: ${tagName} with text '${text.substring(0,30)}'`);",
+                "                try {",
+                "                    element.click();",
+                "                    await new Promise(r => setTimeout(r, 2000)); // Wait longer for content",
+                "                    ",
+                "                    // Capture all code content after clicking",
+                "                    const allCodeBlocks = document.querySelectorAll('pre, code, .highlight, [class*=\"code\"], .code-example');",
+                "                    let capturedCode = '';",
+                "                    ",
+                "                    allCodeBlocks.forEach(block => {",
+                "                        const code = block.textContent || block.innerText || '';",
+                "                        if (code.length > 30 && !capturedCode.includes(code.substring(0, 100))) {",
+                "                            capturedCode += code + '\\n\\n';",
+                "                        }",
+                "                    });",
+                "                    ",
+                "                    if (capturedCode.length > 50) {",
+                "                        // Inject captured code into page",
+                "                        const codeContainer = document.createElement('div');",
+                "                        codeContainer.className = 'extracted-widget-code';",
+                "                        codeContainer.innerHTML = `",
+                "                            <h2>EXTRACTED: ${targetLang.toUpperCase()}</h2>",
+                "                            <pre><code class='language-${targetLang}'>${capturedCode}</code></pre>",
+                "                            <p>Language: ${targetLang} | Extracted: ${capturedCode.length} chars</p>",
+                "                            <hr/>",
+                "                        `;",
+                "                        document.body.appendChild(codeContainer);",
+                "                        console.log(`✅ EXTRACTED ${capturedCode.length} chars for ${targetLang}`);",
+                "                        foundTarget = true;",
+                "                    }",
+                "                    ",
+                "                } catch (e) {",
+                "                    console.log(`❌ Error clicking ${targetLang} element: ${e}`);",
+                "                }",
+                "            }",
+                "        }",
+                "    }",
+                "    ",
+                "    // Strategy 2: Try clicking any element with language name in attributes",
+                "    if (!foundTarget) {",
+                "        const elementsWithLangAttrs = document.querySelectorAll(`[*|*=\"${targetLang}\"], [*|*=\"${targetLang.toUpperCase()}\"]`);",
+                "        for (let element of elementsWithLangAttrs) {",
+                "            console.log(`🔍 Trying attribute-based element for ${targetLang}`);",
+                "            try {",
+                "                element.click();",
+                "                await new Promise(r => setTimeout(r, 1500));",
+                "                foundTarget = true;",
+                "                break;",
+                "            } catch (e) {",
+                "                console.log(`Failed: ${e}`);",
+                "            }",
+                "        }",
+                "    }",
+                "    ",
+                "    if (!foundTarget) {",
+                "        console.log(`❌ No ${targetLang} element found`);",
+                "    }",
+                "}",
+                "",
+                "// Final wait for all interactions to complete",
+                "await new Promise(r => setTimeout(r, 2000));",
                 ""
             ])
         
-        return js_lines
+        return priority_js + [
+            f"// Extract {widget.widget_type} widget: {widget.title}",
+            f"console.log('Processing {widget.widget_type} widget...');",
+            "",
+            "// Strategy 1: Look for specific language buttons",
+            "const languageButtons = document.querySelectorAll(",
+            "    'button[data-language], button[aria-controls*=\"code\"], button[role=\"tab\"], .tab, .language-tab, .code-tab'",
+            ");",
+            "",
+            "console.log(`Found ${languageButtons.length} potential language buttons`);",
+            "",
+            "for (let button of languageButtons) {",
+            "    const text = (button.textContent || button.innerText || '').trim().toLowerCase();",
+            "    const dataLang = button.getAttribute('data-language') || '';",
+            "    const ariaControls = button.getAttribute('aria-controls') || '';",
+            "    ",
+            f"    // Check if this looks like a programming language",
+            f"    const isLanguageTab = /({lang_pattern})/i.test(text) || /({lang_pattern})/i.test(dataLang);",
+            "    ",
+            "    if (isLanguageTab) {",
+            "        console.log(`Clicking language button: ${text} (${dataLang})`);",
+            "        try {",
+            "            button.click();",
+            "            await new Promise(r => setTimeout(r, 1200)); // Wait for content to load",
+            "            ",
+            "            // Capture code content after this tab click",
+            "            const codeBlocks = document.querySelectorAll('pre code, .highlight code, .code-content code, [class*=\"code\"] code, .code-example code');",
+            "            let capturedAny = false;",
+            "            ",
+            "            codeBlocks.forEach((block, idx) => {",
+            "                const code = block.textContent || block.innerText || '';",
+            "                if (code.length > 50) {",
+            "                    // Create a visible code block in the page",
+            "                    const newCodeBlock = document.createElement('div');",
+            "                    newCodeBlock.className = 'widget-extracted-code';",
+            "                    newCodeBlock.innerHTML = `",
+            "                        <h3>Widget Code Example: ${text || dataLang || 'Unknown'}</h3>",
+            "                        <pre><code class='language-${(text || dataLang || '').toLowerCase()}'>${code}</code></pre>",
+            "                        <p>Language: ${text || dataLang} | Length: ${code.length} chars</p>",
+            "                    `;",
+            "                    ",
+            "                    // Append to the end of the page so it gets picked up by markdown",
+            "                    document.body.appendChild(newCodeBlock);",
+            "                    capturedAny = true;",
+            "                    console.log(`Injected ${code.length} chars of ${text} code into page`);",
+            "                }",
+            "            });",
+            "            ",
+            "            if (!capturedAny) {",
+            "                console.log(`No code content found after clicking ${text} tab`);",
+            "            }",
+            "        } catch (e) {",
+            "            console.log(`Error clicking button: ${e}`);",
+            "        }",
+            "    }",
+            "}",
+            "",
+            "// Strategy 2: Click any element containing language names",
+            "const allClickable = document.querySelectorAll('*[onclick], button, [role=\"button\"], .clickable');",
+            "for (let el of allClickable) {",
+            "    const text = (el.textContent || el.innerText || '').trim();",
+            f"    if (/^(shell|python|javascript|go|kotlin|java|php|ruby|curl)$/i.test(text)) {{",
+            "        console.log(`Found language element: ${text}`);",
+            "        try {",
+            "            el.click();",
+            "            await new Promise(r => setTimeout(r, 500));",
+            "        } catch (e) {",
+            "            console.log(`Error clicking element: ${e}`);",
+            "        }",
+            "    }",
+            "}",
+            ""
+        ]
     
-    def _generate_dropdown_extraction_js(self, widget: CodeWidget) -> List[str]:
-        """Generate JavaScript for dropdown-based widgets."""
+    def _generate_dropdown_extraction_js(self, widget: CodeWidget, priority_langs: List[str] = None) -> List[str]:
+        """Generate JavaScript for dropdown-based widgets with language prioritization."""
         
         return [
             "// Handle dropdown widget",
@@ -353,39 +531,53 @@ If no widgets are detected, return confidence 0.0 and empty widgets_found array.
             "}"
         ]
     
-    def _generate_generic_extraction_js(self, widget: CodeWidget) -> List[str]:
+    def _generate_generic_extraction_js(self, widget: CodeWidget, priority_langs: List[str] = None) -> List[str]:
         """Generate JavaScript for unknown widget types."""
+        
+        lang_pattern = '|'.join(self.common_patterns['language_indicators'])
         
         return [
             "// Generic widget interaction",
-            "const clickableElements = document.querySelectorAll('button, [role=\"button\"], .btn, [data-toggle]');",
+            "console.log('Trying generic widget interaction...');",
+            "const clickableElements = document.querySelectorAll('button, [role=\"button\"], .btn, [data-toggle], .clickable');",
             "for (let element of clickableElements) {",
-            "    const text = element.textContent || element.innerText || '';",
-            f"    const hasLangName = /{'/'.join(self.common_patterns['language_indicators'])}/i.test(text);",
+            "    const text = (element.textContent || element.innerText || '').trim();",
+            f"    const hasLangName = /({lang_pattern})/i.test(text);",
             "    if (hasLangName) {",
-            "        console.log(`Clicking element: ${text}`);",
-            "        element.click();",
-            "        await new Promise(r => setTimeout(r, 300));",
+            "        console.log(`Clicking generic element: ${text}`);",
+            "        try {",
+            "            element.click();",
+            "            await new Promise(r => setTimeout(r, 300));",
+            "        } catch (e) {",
+            "            console.log(`Error clicking: ${e}`);",
+            "        }",
             "    }",
             "}"
         ]
 
 
 def create_enhanced_crawler_config(extractor: CodeWidgetExtractor, 
-                                 widgets: List[CodeWidget]) -> CrawlerRunConfig:
+                                 widgets: List[CodeWidget],
+                                 target_languages: List[str] = None) -> CrawlerRunConfig:
     """
     Create a Crawl4AI configuration with widget extraction JavaScript.
+    
+    Args:
+        extractor: The CodeWidgetExtractor instance
+        widgets: List of detected widgets
+        target_languages: List of languages to prioritize for extraction
     """
     
-    extraction_js = extractor.generate_extraction_javascript(widgets)
+    extraction_js = extractor.generate_extraction_javascript(widgets, target_languages)
     
     return CrawlerRunConfig(
         cache_mode="bypass",
         stream=False,
-        wait_for="networkidle",
-        delay_before_return_html=3.0,  # Wait for interactions to complete
+        wait_for=None,  # Don't wait for networkidle to avoid timeout
+        delay_before_return_html=5.0,  # Wait longer for interactions to complete
         js_code=[extraction_js],
         wait_for_images=False,
         screenshot=False,
-        verbose=True
+        verbose=True,
+        page_timeout=30000  # 30 second timeout instead of default 60s
     )
