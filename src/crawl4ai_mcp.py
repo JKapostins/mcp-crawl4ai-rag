@@ -25,7 +25,26 @@ import concurrent.futures
 import sys
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
-from code_widget_extractor import CodeWidgetExtractor, create_enhanced_crawler_config
+try:
+    from code_widget_extractor import CodeWidgetExtractor, create_enhanced_crawler_config
+except ImportError:
+    # Widget extractor not available on main branch
+    CodeWidgetExtractor = None
+    create_enhanced_crawler_config = None
+
+# Conditional imports for Firecrawl
+USE_FIRECRAWL = os.getenv("FIRECRAWL_API_KEY") is not None
+
+if USE_FIRECRAWL:
+    try:
+        from firecrawl import FirecrawlApp
+        print("🔥 Firecrawl integration enabled")
+    except ImportError:
+        print("⚠️  Firecrawl API key found but firecrawl-py not installed. Run: pip install firecrawl-py")
+        USE_FIRECRAWL = False
+else:
+    FirecrawlApp = None
+    print("🕷️  Using Crawl4AI (default crawler)")
 
 # Add knowledge_graphs folder to path for importing knowledge graph modules
 knowledge_graphs_path = Path(__file__).resolve().parent.parent / 'knowledge_graphs'
@@ -122,6 +141,7 @@ class Crawl4AIContext:
     reranking_model: Optional[CrossEncoder] = None
     knowledge_validator: Optional[Any] = None  # KnowledgeGraphValidator when available
     repo_extractor: Optional[Any] = None       # DirectNeo4jExtractor when available
+    firecrawl_app: Optional[Any] = None        # FirecrawlApp when available
 
 @asynccontextmanager
 async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
@@ -146,6 +166,16 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     
     # Initialize Supabase client
     supabase_client = get_supabase_client()
+    
+    # Initialize Firecrawl app if enabled
+    firecrawl_app = None
+    if USE_FIRECRAWL:
+        try:
+            firecrawl_app = FirecrawlApp(api_key=os.getenv("FIRECRAWL_API_KEY"))
+            print("✓ Firecrawl client initialized")
+        except Exception as e:
+            print(f"Failed to initialize Firecrawl client: {e}")
+            firecrawl_app = None
     
     # Initialize cross-encoder model for reranking if enabled
     reranking_model = None
@@ -197,7 +227,8 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
             supabase_client=supabase_client,
             reranking_model=reranking_model,
             knowledge_validator=knowledge_validator,
-            repo_extractor=repo_extractor
+            repo_extractor=repo_extractor,
+            firecrawl_app=firecrawl_app
         )
     finally:
         # Clean up all components
@@ -237,6 +268,16 @@ else:
         host=os.getenv("HOST", "0.0.0.0"),
         port=port
     )
+
+# Conditional decorator for MCP tools
+def conditional_tool(condition: bool):
+    """Decorator that conditionally registers MCP tools based on environment configuration."""
+    def decorator(func):
+        if condition:
+            return mcp.tool()(func)
+        else:
+            return func
+    return decorator
 
 def rerank_results(model: CrossEncoder, query: str, results: List[Dict[str, Any]], content_key: str = "content") -> List[Dict[str, Any]]:
     """
@@ -400,7 +441,9 @@ def process_code_example(args):
     code, context_before, context_after = args
     return generate_code_example_summary(code, context_before, context_after)
 
-@mcp.tool()
+# Action builder utilities for Firecrawl
+
+@conditional_tool(not USE_FIRECRAWL)
 async def crawl_single_page(ctx: Context, url: str) -> str:
     """
     Crawl a single web page and store its content in Supabase.
@@ -545,7 +588,162 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             "error": str(e)
         }, indent=2)
 
-@mcp.tool()
+@conditional_tool(USE_FIRECRAWL)
+async def firecrawl_single_page(ctx: Context, url: str) -> str:
+    """
+    Crawl a single web page using Firecrawl and store its content in Supabase.
+    
+    This tool uses Firecrawl's scraping service to extract clean, LLM-ready content.
+    The content is stored in Supabase for later retrieval and querying.
+    
+    Args:
+        ctx: The MCP server provided context
+        url: URL of the web page to crawl
+    
+    Returns:
+        Summary of the crawling operation and storage in Supabase
+    """
+    try:
+        # Get the firecrawl client from the context
+        firecrawl_app = ctx.request_context.lifespan_context.firecrawl_app
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        if not firecrawl_app:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": "Firecrawl client not initialized"
+            }, indent=2)
+        
+        # Scrape the page with Firecrawl (use simple API for now)
+        firecrawl_result = firecrawl_app.scrape_url(url)
+        
+        # Process the firecrawl response
+        result = process_firecrawl_response(firecrawl_result)
+        
+        if result['success'] and result['markdown']:
+            # Extract source_id
+            parsed_url = urlparse(url)
+            source_id = parsed_url.netloc or parsed_url.path
+            
+            # Chunk the content
+            chunks = smart_chunk_markdown(result['markdown'])
+            
+            # Prepare data for Supabase
+            urls = []
+            chunk_numbers = []
+            contents = []
+            metadatas = []
+            total_word_count = 0
+            
+            for i, chunk in enumerate(chunks):
+                urls.append(url)
+                chunk_numbers.append(i)
+                contents.append(chunk)
+                
+                # Extract metadata
+                meta = extract_section_info(chunk)
+                meta["chunk_index"] = i
+                meta["url"] = url
+                meta["source"] = source_id
+                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                meta["crawler_type"] = "firecrawl"
+                meta["firecrawl_title"] = result.get('title', '')
+                meta["firecrawl_description"] = result.get('description', '')
+                metadatas.append(meta)
+                
+                # Accumulate word count
+                total_word_count += meta.get("word_count", 0)
+            
+            # Create url_to_full_document mapping
+            url_to_full_document = {url: result['markdown']}
+            
+            # Update source information FIRST (before inserting documents)
+            source_summary = extract_source_summary(source_id, result['markdown'][:5000])  # Use first 5000 chars for summary
+            update_source_info(supabase_client, source_id, source_summary, total_word_count)
+            
+            # Add documentation chunks to Supabase (AFTER source exists)
+            add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+            
+            # Extract and process code examples only if enabled
+            extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+            if extract_code_examples:
+                code_blocks = extract_code_blocks(result['markdown'])
+                if code_blocks:
+                    code_urls = []
+                    code_chunk_numbers = []
+                    code_examples = []
+                    code_summaries = []
+                    code_metadatas = []
+                    
+                    # Process code examples in parallel
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                        # Prepare arguments for parallel processing
+                        summary_args = [(block['code'], block['context_before'], block['context_after']) 
+                                        for block in code_blocks]
+                        
+                        # Generate summaries in parallel
+                        summaries = list(executor.map(process_code_example, summary_args))
+                    
+                    # Prepare code example data
+                    for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                        code_urls.append(url)
+                        code_chunk_numbers.append(i)
+                        code_examples.append(block['code'])
+                        code_summaries.append(summary)
+                        
+                        # Create metadata for code example
+                        code_meta = {
+                            "chunk_index": i,
+                            "url": url,
+                            "source": source_id,
+                            "char_count": len(block['code']),
+                            "word_count": len(block['code'].split()),
+                            "language": block.get('language', ''),
+                            "extraction_method": "firecrawl_scrape",
+                            "crawler_type": "firecrawl"
+                        }
+                        code_metadatas.append(code_meta)
+                    
+                    # Add code examples to Supabase
+                    add_code_examples_to_supabase(
+                        supabase_client, 
+                        code_urls, 
+                        code_chunk_numbers, 
+                        code_examples, 
+                        code_summaries, 
+                        code_metadatas
+                    )
+            
+            return json.dumps({
+                "success": True,
+                "url": url,
+                "crawler_type": "firecrawl",
+                "chunks_stored": len(chunks),
+                "code_examples_stored": len(code_blocks) if extract_code_examples and code_blocks else 0,
+                "content_length": len(result['markdown']),
+                "total_word_count": total_word_count,
+                "source_id": source_id,
+                "title": result.get('title', ''),
+                "description": result.get('description', '')
+            }, indent=2)
+        else:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "crawler_type": "firecrawl",
+                "error": result['error_message']
+            }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "url": url,
+            "crawler_type": "firecrawl",
+            "error": str(e)
+        }, indent=2)
+
+
+@conditional_tool(not USE_FIRECRAWL)
 async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000) -> str:
     """
     Intelligently crawl a URL based on its type and store content in Supabase.
@@ -740,6 +938,206 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             "url": url,
             "error": str(e)
         }, indent=2)
+
+@conditional_tool(USE_FIRECRAWL)
+async def firecrawl_smart_crawl(ctx: Context, url: str, max_pages: int = 10, include_paths: str = "", exclude_paths: str = "") -> str:
+    """
+    Intelligently crawl websites using Firecrawl's advanced crawling capabilities.
+    
+    This tool uses Firecrawl's crawl_url method to discover and crawl multiple pages
+    from a website. It's perfect for crawling documentation sites, blogs, or any
+    multi-page content.
+    
+    Args:
+        ctx: The MCP server provided context
+        url: Starting URL or domain to crawl
+        max_pages: Maximum number of pages to crawl (default: 10, max: 100)
+        include_paths: Comma-separated paths to include (e.g., "/docs,/api")
+        exclude_paths: Comma-separated paths to exclude (e.g., "/login,/admin")
+    
+    Returns:
+        Summary of the crawling operation and storage in Supabase
+    """
+    try:
+        # Get the firecrawl client from the context
+        firecrawl_app = ctx.request_context.lifespan_context.firecrawl_app
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        if not firecrawl_app:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": "Firecrawl client not initialized"
+            }, indent=2)
+        
+        # Ensure max_pages is reasonable
+        max_pages = min(max_pages, 100)
+        
+        # Prepare crawl parameters (use simple API for now)
+        # Start the crawl
+        crawl_result = firecrawl_app.crawl_url(url)
+        
+        if not crawl_result or not getattr(crawl_result, 'success', False):
+            error_msg = getattr(crawl_result, 'error', 'Crawl failed') if crawl_result else 'No crawl result'
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "crawler_type": "firecrawl",
+                "error": error_msg
+            }, indent=2)
+        
+        # Process crawled pages
+        pages_data = getattr(crawl_result, 'data', []) or []
+        
+        if not pages_data:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "crawler_type": "firecrawl",
+                "error": "No pages found"
+            }, indent=2)
+        
+        # Process each page
+        total_chunks = 0
+        total_code_examples = 0
+        total_word_count = 0
+        pages_processed = 0
+        
+        for page_data in pages_data:
+            try:
+                page_url = getattr(page_data, 'url', '') if hasattr(page_data, 'url') else page_data.get('url', '')
+                markdown_content = getattr(page_data, 'markdown', '') if hasattr(page_data, 'markdown') else page_data.get('markdown', '')
+                metadata = getattr(page_data, 'metadata', {}) if hasattr(page_data, 'metadata') else page_data.get('metadata', {})
+                
+                if not markdown_content or not page_url:
+                    continue
+                
+                # Extract source_id
+                parsed_url = urlparse(page_url)
+                source_id = parsed_url.netloc or parsed_url.path
+                
+                # Chunk the content
+                chunks = smart_chunk_markdown(markdown_content)
+                
+                # Prepare data for Supabase
+                urls = []
+                chunk_numbers = []
+                contents = []
+                metadatas = []
+                page_word_count = 0
+                
+                for i, chunk in enumerate(chunks):
+                    urls.append(page_url)
+                    chunk_numbers.append(i)
+                    contents.append(chunk)
+                    
+                    # Extract metadata
+                    meta = extract_section_info(chunk)
+                    meta["chunk_index"] = i
+                    meta["url"] = page_url
+                    meta["source"] = source_id
+                    meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                    meta["crawler_type"] = "firecrawl"
+                    meta["firecrawl_title"] = metadata.get('title', '')
+                    meta["firecrawl_description"] = metadata.get('description', '')
+                    metadatas.append(meta)
+                    
+                    # Accumulate word count
+                    page_word_count += meta.get("word_count", 0)
+                
+                # Create url_to_full_document mapping
+                url_to_full_document = {page_url: markdown_content}
+                
+                # Update source information
+                source_summary = extract_source_summary(source_id, markdown_content[:5000])
+                update_source_info(supabase_client, source_id, source_summary, page_word_count)
+                
+                # Add documentation chunks to Supabase
+                add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+                
+                # Extract and process code examples if enabled
+                extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+                if extract_code_examples:
+                    code_blocks = extract_code_blocks(markdown_content)
+                    if code_blocks:
+                        code_urls = []
+                        code_chunk_numbers = []
+                        code_examples = []
+                        code_summaries = []
+                        code_metadatas = []
+                        
+                        # Process code examples in parallel
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                            # Prepare arguments for parallel processing
+                            summary_args = [(block['code'], block['context_before'], block['context_after']) 
+                                            for block in code_blocks]
+                            
+                            # Generate summaries in parallel
+                            summaries = list(executor.map(process_code_example, summary_args))
+                        
+                        # Prepare code example data
+                        for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                            code_urls.append(page_url)
+                            code_chunk_numbers.append(i)
+                            code_examples.append(block['code'])
+                            code_summaries.append(summary)
+                            
+                            # Create metadata for code example
+                            code_meta = {
+                                "chunk_index": i,
+                                "url": page_url,
+                                "source": source_id,
+                                "char_count": len(block['code']),
+                                "word_count": len(block['code'].split()),
+                                "language": block.get('language', ''),
+                                "extraction_method": "firecrawl_crawl",
+                                "crawler_type": "firecrawl"
+                            }
+                            code_metadatas.append(code_meta)
+                        
+                        # Add code examples to Supabase
+                        add_code_examples_to_supabase(
+                            supabase_client, 
+                            code_urls, 
+                            code_chunk_numbers, 
+                            code_examples, 
+                            code_summaries, 
+                            code_metadatas
+                        )
+                        
+                        total_code_examples += len(code_blocks)
+                
+                total_chunks += len(chunks)
+                total_word_count += page_word_count
+                pages_processed += 1
+                
+            except Exception as page_error:
+                print(f"Error processing page {page_data.get('url', 'unknown')}: {page_error}")
+                continue
+        
+        return json.dumps({
+            "success": True,
+            "url": url,
+            "crawler_type": "firecrawl",
+            "pages_crawled": pages_processed,
+            "chunks_stored": total_chunks,
+            "code_examples_stored": total_code_examples,
+            "total_word_count": total_word_count,
+            "crawl_params": {
+                "max_pages": max_pages,
+                "include_paths": include_paths,
+                "exclude_paths": exclude_paths
+            }
+        }, indent=2)
+        
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "url": url,
+            "crawler_type": "firecrawl",
+            "error": str(e)
+        }, indent=2)
+
 
 @mcp.tool()
 async def get_available_sources(ctx: Context) -> str:

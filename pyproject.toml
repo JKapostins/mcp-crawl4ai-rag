@@ -12,4 +12,5 @@ dependencies = [
     "dotenv==0.9.9",
     "sentence-transformers>=4.1.0",
     "neo4j>=5.28.1",
+    "firecrawl-py>=1.4.0",
 ]
