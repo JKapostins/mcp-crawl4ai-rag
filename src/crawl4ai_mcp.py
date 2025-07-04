@@ -26,6 +26,18 @@ import sys
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 
+# Conditional import for Firecrawl
+FIRECRAWL_AVAILABLE = os.getenv("FIRECRAWL_API_KEY") is not None
+if FIRECRAWL_AVAILABLE:
+    from firecrawl import FirecrawlApp
+    
+# OpenAI import for LLM cleaning
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
 # Add knowledge_graphs folder to path for importing knowledge graph modules
 knowledge_graphs_path = Path(__file__).resolve().parent.parent / 'knowledge_graphs'
 sys.path.append(str(knowledge_graphs_path))
@@ -47,6 +59,86 @@ from knowledge_graph_validator import KnowledgeGraphValidator
 from parse_repo_into_neo4j import DirectNeo4jExtractor
 from ai_script_analyzer import AIScriptAnalyzer
 from hallucination_reporter import HallucinationReporter
+
+def clean_markdown_for_rag(markdown_content: str, url: str) -> str:
+    """
+    Clean and optimize markdown content for RAG consumption using an LLM.
+    
+    Args:
+        markdown_content: Raw markdown content from web scraping
+        url: Source URL for context
+        
+    Returns:
+        Cleaned and structured markdown optimized for RAG
+    """
+    if not OPENAI_AVAILABLE:
+        return markdown_content
+    
+    try:
+        # Get OpenAI configuration from environment
+        api_key = os.getenv("OPENAI_API_KEY")
+        model = os.getenv("MODEL_CHOICE", "gpt-4o-mini")
+        
+        if not api_key:
+            return markdown_content
+            
+        client = openai.OpenAI(api_key=api_key)
+        
+        system_prompt = """You are an expert content curator specializing in optimizing technical documentation for RAG (Retrieval-Augmented Generation) systems.
+
+Your task is to clean and restructure markdown content to be maximally useful for LLM consumption while preserving all technical information.
+
+REMOVE these elements:
+- Navigation breadcrumbs and UI elements
+- Duplicate or redundant headings
+- Marketing CTAs and signup prompts
+- Copy buttons, "Copied" indicators, and UI artifacts
+- Social sharing buttons and feedback prompts
+- Irrelevant footer content and support links
+- Broken or incomplete sentences from HTML parsing
+
+ENHANCE these elements:
+- Create clear hierarchical structure with logical H1/H2/H3 headings
+- Consolidate fragmented information into coherent sections
+- Add context to code examples and technical specifications
+- Ensure all API parameters, responses, and examples are properly documented
+- Structure content for easy chunking and semantic search
+- Preserve all technical details, URLs, and reference links
+
+STRUCTURE the output with these sections (when applicable):
+1. Overview/Description
+2. Use Cases/Applications  
+3. Technical Specifications/Parameters
+4. API Endpoints/Methods
+5. Code Examples/Implementation
+6. Response Formats/Data Structures
+7. Related Resources/References
+
+Maintain technical accuracy while making the content more consumable for RAG systems."""
+
+        user_prompt = f"""Please clean and optimize this markdown content from {url} for RAG consumption:
+
+{markdown_content}
+
+Return only the cleaned markdown content with no additional commentary or metadata headers. The content should be ready for direct indexing into a RAG knowledge base."""
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=4000
+        )
+        
+        cleaned_content = response.choices[0].message.content.strip()
+        return cleaned_content
+        
+    except Exception as e:
+        # If LLM cleaning fails, return original content
+        print(f"Warning: LLM cleaning failed: {e}")
+        return markdown_content
 
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
@@ -399,145 +491,355 @@ def process_code_example(args):
     code, context_before, context_after = args
     return generate_code_example_summary(code, context_before, context_after)
 
-@mcp.tool()
-async def crawl_single_page(ctx: Context, url: str) -> str:
-    """
-    Crawl a single web page and store its content in Supabase.
-    
-    This tool is ideal for quickly retrieving content from a specific URL without following links.
-    The content is stored in Supabase for later retrieval and querying.
-    
-    Args:
-        ctx: The MCP server provided context
-        url: URL of the web page to crawl
-    
-    Returns:
-        Summary of the crawling operation and storage in Supabase
-    """
-    try:
-        # Get the crawler from the context
-        crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+# Only register the original crawl_single_page if Firecrawl is not available
+if not FIRECRAWL_AVAILABLE:
+    @mcp.tool()
+    async def crawl_single_page(ctx: Context, url: str) -> str:
+        """
+        Crawl a single web page and store its content in Supabase.
         
-        # Configure the crawl
-        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+        This tool is ideal for quickly retrieving content from a specific URL without following links.
+        The content is stored in Supabase for later retrieval and querying.
         
-        # Crawl the page
-        result = await crawler.arun(url=url, config=run_config)
+        Args:
+            ctx: The MCP server provided context
+            url: URL of the web page to crawl
         
-        if result.success and result.markdown:
-            # Extract source_id
-            parsed_url = urlparse(url)
-            source_id = parsed_url.netloc or parsed_url.path
+        Returns:
+            Summary of the crawling operation and storage in Supabase
+        """
+        try:
+            # Get the crawler from the context
+            crawler = ctx.request_context.lifespan_context.crawler
+            supabase_client = ctx.request_context.lifespan_context.supabase_client
             
-            # Chunk the content
-            chunks = smart_chunk_markdown(result.markdown)
+            # Configure the crawl
+            run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
             
-            # Prepare data for Supabase
-            urls = []
-            chunk_numbers = []
-            contents = []
-            metadatas = []
-            total_word_count = 0
+            # Crawl the page
+            result = await crawler.arun(url=url, config=run_config)
             
-            for i, chunk in enumerate(chunks):
-                urls.append(url)
-                chunk_numbers.append(i)
-                contents.append(chunk)
+            if result.success and result.markdown:
+                # Extract source_id
+                parsed_url = urlparse(url)
+                source_id = parsed_url.netloc or parsed_url.path
                 
-                # Extract metadata
-                meta = extract_section_info(chunk)
-                meta["chunk_index"] = i
-                meta["url"] = url
-                meta["source"] = source_id
-                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
-                metadatas.append(meta)
+                # Chunk the content
+                chunks = smart_chunk_markdown(result.markdown)
                 
-                # Accumulate word count
-                total_word_count += meta.get("word_count", 0)
-            
-            # Create url_to_full_document mapping
-            url_to_full_document = {url: result.markdown}
-            
-            # Update source information FIRST (before inserting documents)
-            source_summary = extract_source_summary(source_id, result.markdown[:5000])  # Use first 5000 chars for summary
-            update_source_info(supabase_client, source_id, source_summary, total_word_count)
-            
-            # Add documentation chunks to Supabase (AFTER source exists)
-            add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
-            
-            # Extract and process code examples only if enabled
-            extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
-            if extract_code_examples:
-                code_blocks = extract_code_blocks(result.markdown)
-                if code_blocks:
-                    code_urls = []
-                    code_chunk_numbers = []
-                    code_examples = []
-                    code_summaries = []
-                    code_metadatas = []
+                # Prepare data for Supabase
+                urls = []
+                chunk_numbers = []
+                contents = []
+                metadatas = []
+                total_word_count = 0
+                
+                for i, chunk in enumerate(chunks):
+                    urls.append(url)
+                    chunk_numbers.append(i)
+                    contents.append(chunk)
                     
-                    # Process code examples in parallel
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        # Prepare arguments for parallel processing
-                        summary_args = [(block['code'], block['context_before'], block['context_after']) 
-                                        for block in code_blocks]
+                    # Extract metadata
+                    meta = extract_section_info(chunk)
+                    meta["chunk_index"] = i
+                    meta["url"] = url
+                    meta["source"] = source_id
+                    meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                    metadatas.append(meta)
+                    
+                    # Accumulate word count
+                    total_word_count += meta.get("word_count", 0)
+                
+                # Create url_to_full_document mapping
+                url_to_full_document = {url: result.markdown}
+                
+                # Update source information FIRST (before inserting documents)
+                source_summary = extract_source_summary(source_id, result.markdown[:5000])  # Use first 5000 chars for summary
+                update_source_info(supabase_client, source_id, source_summary, total_word_count)
+                
+                # Add documentation chunks to Supabase (AFTER source exists)
+                add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+                
+                # Extract and process code examples only if enabled
+                extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+                if extract_code_examples:
+                    code_blocks = extract_code_blocks(result.markdown, min_length=25)
+                    if code_blocks:
+                        code_urls = []
+                        code_chunk_numbers = []
+                        code_examples = []
+                        code_summaries = []
+                        code_metadatas = []
                         
-                        # Generate summaries in parallel
-                        summaries = list(executor.map(process_code_example, summary_args))
-                    
-                    # Prepare code example data
-                    for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
-                        code_urls.append(url)
-                        code_chunk_numbers.append(i)
-                        code_examples.append(block['code'])
-                        code_summaries.append(summary)
+                        # Process code examples in parallel
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                            # Prepare arguments for parallel processing
+                            summary_args = [(block['code'], block['context_before'], block['context_after']) 
+                                            for block in code_blocks]
+                            
+                            # Generate summaries in parallel
+                            summaries = list(executor.map(process_code_example, summary_args))
                         
-                        # Create metadata for code example
-                        code_meta = {
-                            "chunk_index": i,
-                            "url": url,
-                            "source": source_id,
-                            "char_count": len(block['code']),
-                            "word_count": len(block['code'].split())
-                        }
-                        code_metadatas.append(code_meta)
-                    
-                    # Add code examples to Supabase
-                    add_code_examples_to_supabase(
-                        supabase_client, 
-                        code_urls, 
-                        code_chunk_numbers, 
-                        code_examples, 
-                        code_summaries, 
-                        code_metadatas
-                    )
-            
-            return json.dumps({
-                "success": True,
-                "url": url,
-                "chunks_stored": len(chunks),
-                "code_examples_stored": len(code_blocks) if code_blocks else 0,
-                "content_length": len(result.markdown),
-                "total_word_count": total_word_count,
-                "source_id": source_id,
-                "links_count": {
-                    "internal": len(result.links.get("internal", [])),
-                    "external": len(result.links.get("external", []))
-                }
-            }, indent=2)
-        else:
+                        # Prepare code example data
+                        for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                            code_urls.append(url)
+                            code_chunk_numbers.append(i)
+                            code_examples.append(block['code'])
+                            code_summaries.append(summary)
+                            
+                            # Create metadata for code example
+                            code_meta = {
+                                "chunk_index": i,
+                                "url": url,
+                                "source": source_id,
+                                "char_count": len(block['code']),
+                                "word_count": len(block['code'].split())
+                            }
+                            code_metadatas.append(code_meta)
+                        
+                        # Add code examples to Supabase
+                        add_code_examples_to_supabase(
+                            supabase_client, 
+                            code_urls, 
+                            code_chunk_numbers, 
+                            code_examples, 
+                            code_summaries, 
+                            code_metadatas
+                        )
+                
+                return json.dumps({
+                    "success": True,
+                    "url": url,
+                    "chunks_stored": len(chunks),
+                    "code_examples_stored": len(code_blocks) if code_blocks else 0,
+                    "content_length": len(result.markdown),
+                    "total_word_count": total_word_count,
+                    "source_id": source_id,
+                    "links_count": {
+                        "internal": len(result.links.get("internal", [])),
+                        "external": len(result.links.get("external", []))
+                    }
+                }, indent=2)
+            else:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": result.error_message
+                }, indent=2)
+        except Exception as e:
             return json.dumps({
                 "success": False,
                 "url": url,
-                "error": result.error_message
+                "error": str(e)
             }, indent=2)
-    except Exception as e:
-        return json.dumps({
-            "success": False,
-            "url": url,
-            "error": str(e)
-        }, indent=2)
+
+# Firecrawl version of crawl_single_page
+if FIRECRAWL_AVAILABLE:
+    @mcp.tool()
+    async def crawl_single_page(
+        ctx: Context,
+        url: str,
+        format: str = "markdown",
+        agent_model: str = "FIRE-1",
+        agent_prompt: Optional[str] = None,
+        only_main_content: bool = True,
+        include_tags: Optional[List[str]] = None,
+        exclude_tags: Optional[List[str]] = None,
+        wait_for: int = 1000,
+        timeout: int = 15000
+    ) -> str:
+        """
+        Crawl a single web page using Firecrawl and store its content in Supabase.
+        
+        This tool uses Firecrawl for web crawling with optional AI agent capabilities.
+        When agent_prompt is provided, it uses the agent mode to interact with the page.
+        The scraped markdown content is automatically cleaned and optimized for RAG using an LLM 
+        when USE_AGENTIC_RAG environment variable is set to "true".
+        
+        Args:
+            ctx: The MCP server provided context
+            url: URL of the web page to crawl
+            format: Format for the scraped content (default: "markdown")
+            agent_model: AI model to use for agent mode (default: "FIRE-1")
+            agent_prompt: Optional prompt for agent mode. If provided, enables agent mode.
+            only_main_content: Extract only main content, removing ads/navigation (default: True)
+            include_tags: List of HTML tags/selectors to include (e.g., ["h1", "p", ".main-content"])
+            exclude_tags: List of HTML tags/selectors to exclude (e.g., ["#ad", "#footer"])
+            wait_for: Time to wait after page load in milliseconds (default: 1000)
+            timeout: Maximum time to wait for page load in milliseconds (default: 15000)
+        
+        Returns:
+            Summary of the crawling operation and storage in Supabase
+        """
+        try:
+            # Initialize Firecrawl
+            api_key = os.getenv("FIRECRAWL_API_KEY")
+            if not api_key:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": "FIRECRAWL_API_KEY not found in environment variables"
+                }, indent=2)
+                
+            app = FirecrawlApp(api_key=api_key)
+            supabase_client = ctx.request_context.lifespan_context.supabase_client
+            
+            # Configure scrape options
+            scrape_options = {
+                'formats': [format] if format != "markdown" else ['markdown'],
+                'onlyMainContent': only_main_content,
+                'waitFor': wait_for,
+                'timeout': timeout
+            }
+            
+            # Add include/exclude tags if provided
+            if include_tags:
+                scrape_options['includeTags'] = include_tags
+            if exclude_tags:
+                scrape_options['excludeTags'] = exclude_tags
+            
+            # Add agent configuration if prompt is provided
+            if agent_prompt:
+                scrape_options['agent'] = {
+                    'model': agent_model,
+                    'prompt': agent_prompt
+                }
+            
+            # Scrape the page
+            result = app.scrape_url(url, **scrape_options)
+            
+            if result and hasattr(result, 'markdown') and result.markdown:
+                raw_markdown_content = result.markdown
+                
+                # Clean markdown content for RAG using LLM if agentic RAG is enabled
+                use_agentic_rag = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+                if use_agentic_rag:
+                    markdown_content = clean_markdown_for_rag(raw_markdown_content, url)
+                else:
+                    markdown_content = raw_markdown_content
+                
+                # Extract source_id
+                parsed_url = urlparse(url)
+                source_id = parsed_url.netloc or parsed_url.path
+                
+                # Note: smart_chunk_markdown and extract_section_info are defined in this file
+                
+                # Chunk the content
+                chunks = smart_chunk_markdown(markdown_content)
+                
+                # Prepare data for Supabase
+                urls = []
+                chunk_numbers = []
+                contents = []
+                metadatas = []
+                total_word_count = 0
+                
+                for i, chunk in enumerate(chunks):
+                    urls.append(url)
+                    chunk_numbers.append(i)
+                    contents.append(chunk)
+                    
+                    # Extract metadata
+                    meta = extract_section_info(chunk)
+                    meta["chunk_index"] = i
+                    meta["url"] = url
+                    meta["source"] = source_id
+                    meta["crawl_time"] = "firecrawl_scrape"
+                    meta["crawl_method"] = "firecrawl"
+                    if agent_prompt:
+                        meta["agent_used"] = True
+                        meta["agent_model"] = agent_model
+                    metadatas.append(meta)
+                    
+                    # Accumulate word count
+                    total_word_count += meta.get("word_count", 0)
+                
+                # Create url_to_full_document mapping
+                url_to_full_document = {url: markdown_content}
+                
+                # Update source information FIRST (before inserting documents)
+                source_summary = extract_source_summary(source_id, markdown_content[:5000])
+                update_source_info(supabase_client, source_id, source_summary, total_word_count)
+                
+                # Add documentation chunks to Supabase
+                add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+                
+                # Extract and process code examples only if enabled
+                extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+                code_blocks = []
+                if extract_code_examples:
+                    code_blocks = extract_code_blocks(markdown_content, min_length=25)
+                    if code_blocks:
+                        code_urls = []
+                        code_chunk_numbers = []
+                        code_examples = []
+                        code_summaries = []
+                        code_metadatas = []
+                        
+                        # Process code examples in parallel
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                            # Prepare arguments for parallel processing
+                            summary_args = [(block['code'], block['context_before'], block['context_after']) 
+                                            for block in code_blocks]
+                            
+                            # Generate summaries in parallel
+                            summaries = list(executor.map(process_code_example, summary_args))
+                        
+                        # Prepare code example data
+                        for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                            code_urls.append(url)
+                            code_chunk_numbers.append(i)
+                            code_examples.append(block['code'])
+                            code_summaries.append(summary)
+                            
+                            # Create metadata for code example
+                            code_meta = {
+                                "chunk_index": i,
+                                "url": url,
+                                "source": source_id,
+                                "char_count": len(block['code']),
+                                "word_count": len(block['code'].split()),
+                                "crawl_method": "firecrawl"
+                            }
+                            code_metadatas.append(code_meta)
+                        
+                        # Add code examples to Supabase
+                        add_code_examples_to_supabase(
+                            supabase_client, 
+                            code_urls, 
+                            code_chunk_numbers, 
+                            code_examples, 
+                            code_summaries, 
+                            code_metadatas
+                        )
+                
+                return json.dumps({
+                    "success": True,
+                    "url": url,
+                    "chunks_stored": len(chunks),
+                    "code_examples_stored": len(code_blocks) if code_blocks else 0,
+                    "content_length": len(markdown_content),
+                    "raw_content_length": len(raw_markdown_content),
+                    "total_word_count": total_word_count,
+                    "source_id": source_id,
+                    "crawl_method": "firecrawl",
+                    "agent_used": agent_prompt is not None,
+                    "agent_model": agent_model if agent_prompt else None,
+                    "llm_cleaned": use_agentic_rag and OPENAI_AVAILABLE,
+                    "format": format
+                }, indent=2)
+            else:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": "No markdown content returned from Firecrawl"
+                }, indent=2)
+        except Exception as e:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": str(e)
+            }, indent=2)
 
 @mcp.tool()
 async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000) -> str:
@@ -674,7 +976,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             for doc in crawl_results:
                 source_url = doc['url']
                 md = doc['markdown']
-                code_blocks = extract_code_blocks(md)
+                code_blocks = extract_code_blocks(md, min_length=25)
                 
                 if code_blocks:
                     # Process code examples in parallel
