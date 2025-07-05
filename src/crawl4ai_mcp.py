@@ -815,6 +815,289 @@ if FIRECRAWL_AVAILABLE:
                 "error": str(e)
             }, indent=2)
 
+    @mcp.tool()
+    async def crawl_website(
+        ctx: Context,
+        url: str,
+        limit: int = 100,
+        async_crawl: bool = False,
+        allowed_domains: Optional[List[str]] = None,
+        exclude_patterns: Optional[List[str]] = None,
+        include_patterns: Optional[List[str]] = None,
+        only_main_content: bool = True,
+        include_tags: Optional[List[str]] = None,
+        exclude_tags: Optional[List[str]] = None,
+        wait_for: int = 1000,
+        timeout: int = 15000,
+        poll_interval: int = 30
+    ) -> str:
+        """
+        Crawl an entire website using Firecrawl and store all content in Supabase.
+        
+        This tool uses Firecrawl to crawl multiple pages from a website, with support for
+        both synchronous and asynchronous crawling. All crawled content is automatically 
+        cleaned and optimized for RAG using an LLM when USE_AGENTIC_RAG environment 
+        variable is set to "true".
+        
+        Args:
+            ctx: The MCP server provided context
+            url: Starting URL to crawl
+            limit: Maximum number of pages to crawl (default: 100)
+            async_crawl: Use async crawling for better performance on large sites (default: False)
+            allowed_domains: List of domains to restrict crawling to (e.g., ["example.com"])
+            exclude_patterns: List of URL patterns to exclude (e.g., ["/admin/*", "*.pdf"])
+            include_patterns: List of URL patterns to include (e.g., ["/docs/*", "/api/*"])
+            only_main_content: Extract only main content, removing ads/navigation (default: True)
+            include_tags: List of HTML tags/selectors to include (e.g., ["h1", "p", ".main-content"])
+            exclude_tags: List of HTML tags/selectors to exclude (e.g., ["#ad", "#footer"])
+            wait_for: Time to wait after page load in milliseconds (default: 1000)
+            timeout: Maximum time to wait for page load in milliseconds (default: 15000)
+            poll_interval: Interval to check async crawl status in seconds (default: 30)
+        
+        Returns:
+            Summary of the crawling operation and storage in Supabase
+        """
+        try:
+            # Initialize Firecrawl
+            api_key = os.getenv("FIRECRAWL_API_KEY")
+            if not api_key:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": "FIRECRAWL_API_KEY not found in environment variables"
+                }, indent=2)
+                
+            app = FirecrawlApp(api_key=api_key)
+            supabase_client = ctx.request_context.lifespan_context.supabase_client
+            
+            # Configure scrape options for each page
+            scrape_options = {
+                'formats': ['markdown'],
+                'onlyMainContent': only_main_content,
+                'waitFor': wait_for,
+                'timeout': timeout
+            }
+            
+            # Add include/exclude tags if provided
+            if include_tags:
+                scrape_options['includeTags'] = include_tags
+            if exclude_tags:
+                scrape_options['excludeTags'] = exclude_tags
+            
+            # Configure crawl parameters
+            crawl_params = {
+                'limit': limit,
+                'scrape_options': scrape_options
+            }
+            
+            # Add domain and pattern restrictions if provided
+            if allowed_domains:
+                crawl_params['allowedDomains'] = allowed_domains
+            if exclude_patterns:
+                crawl_params['excludePaths'] = exclude_patterns
+            if include_patterns:
+                crawl_params['includePaths'] = include_patterns
+            
+            # Execute crawl based on async_crawl flag
+            if async_crawl:
+                print(f"Starting async crawl of {url} with limit {limit}...")
+                
+                # Start async crawl
+                async_result = app.async_crawl_url(url, **crawl_params)
+                
+                if not async_result or not hasattr(async_result, 'id'):
+                    return json.dumps({
+                        "success": False,
+                        "url": url,
+                        "error": "Failed to start async crawl - no job ID returned"
+                    }, indent=2)
+                
+                job_id = async_result.id
+                print(f"Async crawl started with job ID: {job_id}")
+                
+                # Poll for completion
+                max_wait_time = 30 * 60  # 30 minutes max
+                elapsed_time = 0
+                
+                while elapsed_time < max_wait_time:
+                    status_result = app.check_crawl_status(job_id)
+                    
+                    if not status_result:
+                        return json.dumps({
+                            "success": False,
+                            "url": url,
+                            "error": f"Failed to check status for job {job_id}"
+                        }, indent=2)
+                    
+                    print(f"Crawl status: {status_result.status} - {status_result.completed}/{status_result.total} pages")
+                    
+                    if status_result.status == "completed":
+                        crawl_result = status_result
+                        break
+                    elif status_result.status == "failed":
+                        return json.dumps({
+                            "success": False,
+                            "url": url,
+                            "error": f"Async crawl failed: {getattr(status_result, 'error', 'Unknown error')}"
+                        }, indent=2)
+                    
+                    # Wait before next check
+                    await asyncio.sleep(poll_interval)
+                    elapsed_time += poll_interval
+                
+                if elapsed_time >= max_wait_time:
+                    # Cancel the crawl and return timeout error
+                    app.cancel_crawl(job_id)
+                    return json.dumps({
+                        "success": False,
+                        "url": url,
+                        "error": f"Async crawl timed out after {max_wait_time} seconds"
+                    }, indent=2)
+            else:
+                print(f"Starting synchronous crawl of {url} with limit {limit}...")
+                # Synchronous crawl
+                crawl_result = app.crawl_url(url, **crawl_params)
+            
+            # Process crawl results
+            if not crawl_result or not hasattr(crawl_result, 'data') or not crawl_result.data:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": "No data returned from crawl operation"
+                }, indent=2)
+            
+            pages = crawl_result.data
+            print(f"Successfully crawled {len(pages)} pages")
+            
+            # Extract source_id
+            parsed_url = urlparse(url)
+            source_id = parsed_url.netloc or parsed_url.path
+            
+            # Process all pages
+            all_urls = []
+            all_chunk_numbers = []
+            all_contents = []
+            all_metadatas = []
+            all_code_urls = []
+            all_code_chunk_numbers = []
+            all_code_examples = []
+            all_code_summaries = []
+            all_code_metadatas = []
+            total_word_count = 0
+            total_code_blocks = 0
+            use_agentic_rag = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+            extract_code_examples = use_agentic_rag
+            
+            url_to_full_document = {}
+            
+            for page_idx, page in enumerate(pages):
+                if not hasattr(page, 'markdown') or not page.markdown:
+                    continue
+                
+                page_url = getattr(page, 'url', f"{url}/page-{page_idx}")
+                raw_markdown_content = page.markdown
+                
+                # Clean markdown content for RAG using LLM if enabled
+                if use_agentic_rag:
+                    markdown_content = clean_markdown_for_rag(raw_markdown_content, page_url)
+                else:
+                    markdown_content = raw_markdown_content
+                
+                url_to_full_document[page_url] = markdown_content
+                
+                # Chunk the content
+                chunks = smart_chunk_markdown(markdown_content)
+                
+                # Process chunks for this page
+                for i, chunk in enumerate(chunks):
+                    all_urls.append(page_url)
+                    all_chunk_numbers.append(i)
+                    all_contents.append(chunk)
+                    
+                    # Extract metadata
+                    meta = extract_section_info(chunk)
+                    meta["chunk_index"] = i
+                    meta["page_index"] = page_idx
+                    meta["url"] = page_url
+                    meta["source"] = source_id
+                    meta["crawl_time"] = "firecrawl_crawl"
+                    meta["crawl_method"] = "firecrawl"
+                    meta["async_crawl"] = async_crawl
+                    all_metadatas.append(meta)
+                    
+                    # Accumulate word count
+                    total_word_count += meta.get("word_count", 0)
+                
+                # Extract code examples from this page if enabled
+                if extract_code_examples:
+                    code_blocks = extract_code_blocks_with_llm(markdown_content, page_url)
+                    if code_blocks:
+                        for i, block in enumerate(code_blocks):
+                            all_code_urls.append(page_url)
+                            all_code_chunk_numbers.append(i)
+                            all_code_examples.append(block['code'])
+                            all_code_summaries.append(block.get('summary', f"{block.get('language', 'code')} example"))
+                            
+                            # Create metadata for code example
+                            code_meta = {
+                                "chunk_index": i,
+                                "page_index": page_idx,
+                                "url": page_url,
+                                "source": source_id,
+                                "char_count": len(block['code']),
+                                "word_count": len(block['code'].split()),
+                                "crawl_method": "firecrawl",
+                                "language": block.get('language', ''),
+                                "type": block.get('type', 'code_block'),
+                                "extraction_method": "llm"
+                            }
+                            all_code_metadatas.append(code_meta)
+                            total_code_blocks += 1
+            
+            # Update source information FIRST (before inserting documents)
+            combined_content = "\n\n".join(list(url_to_full_document.values())[:3])  # Use first 3 pages for summary
+            source_summary = extract_source_summary(source_id, combined_content[:5000])
+            update_source_info(supabase_client, source_id, source_summary, total_word_count)
+            
+            # Add all documentation chunks to Supabase
+            if all_contents:
+                add_documents_to_supabase(supabase_client, all_urls, all_chunk_numbers, all_contents, all_metadatas, url_to_full_document)
+            
+            # Add all code examples to Supabase
+            if all_code_examples:
+                add_code_examples_to_supabase(
+                    supabase_client, 
+                    all_code_urls, 
+                    all_code_chunk_numbers, 
+                    all_code_examples, 
+                    all_code_summaries, 
+                    all_code_metadatas
+                )
+            
+            return json.dumps({
+                "success": True,
+                "url": url,
+                "pages_crawled": len(pages),
+                "chunks_stored": len(all_contents),
+                "code_examples_stored": total_code_blocks,
+                "total_word_count": total_word_count,
+                "source_id": source_id,
+                "crawl_method": "firecrawl",
+                "async_crawl": async_crawl,
+                "limit": limit,
+                "llm_cleaned": use_agentic_rag and OPENAI_AVAILABLE,
+                "allowed_domains": allowed_domains,
+                "exclude_patterns": exclude_patterns,
+                "include_patterns": include_patterns
+            }, indent=2)
+            
+        except Exception as e:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": str(e)
+            }, indent=2)
+
 @mcp.tool()
 async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000) -> str:
     """
