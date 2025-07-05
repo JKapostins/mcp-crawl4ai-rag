@@ -46,8 +46,7 @@ from utils import (
     get_supabase_client, 
     add_documents_to_supabase, 
     search_documents,
-    extract_code_blocks,
-    generate_code_example_summary,
+    extract_code_blocks_with_llm,
     add_code_examples_to_supabase,
     update_source_info,
     extract_source_summary,
@@ -477,19 +476,6 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
         "word_count": len(chunk.split())
     }
 
-def process_code_example(args):
-    """
-    Process a single code example to generate its summary.
-    This function is designed to be used with concurrent.futures.
-    
-    Args:
-        args: Tuple containing (code, context_before, context_after)
-        
-    Returns:
-        The generated summary
-    """
-    code, context_before, context_after = args
-    return generate_code_example_summary(code, context_before, context_after)
 
 # Only register the original crawl_single_page if Firecrawl is not available
 if not FIRECRAWL_AVAILABLE:
@@ -563,7 +549,7 @@ if not FIRECRAWL_AVAILABLE:
                 # Extract and process code examples only if enabled
                 extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
                 if extract_code_examples:
-                    code_blocks = extract_code_blocks(result.markdown, min_length=25)
+                    code_blocks = extract_code_blocks_with_llm(result.markdown, url)
                     if code_blocks:
                         code_urls = []
                         code_chunk_numbers = []
@@ -571,21 +557,12 @@ if not FIRECRAWL_AVAILABLE:
                         code_summaries = []
                         code_metadatas = []
                         
-                        # Process code examples in parallel
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                            # Prepare arguments for parallel processing
-                            summary_args = [(block['code'], block['context_before'], block['context_after']) 
-                                            for block in code_blocks]
-                            
-                            # Generate summaries in parallel
-                            summaries = list(executor.map(process_code_example, summary_args))
-                        
-                        # Prepare code example data
-                        for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                        # Prepare code example data - LLM already provides summaries
+                        for i, block in enumerate(code_blocks):
                             code_urls.append(url)
                             code_chunk_numbers.append(i)
                             code_examples.append(block['code'])
-                            code_summaries.append(summary)
+                            code_summaries.append(block.get('summary', f"{block.get('language', 'code')} example"))
                             
                             # Create metadata for code example
                             code_meta = {
@@ -593,7 +570,10 @@ if not FIRECRAWL_AVAILABLE:
                                 "url": url,
                                 "source": source_id,
                                 "char_count": len(block['code']),
-                                "word_count": len(block['code'].split())
+                                "word_count": len(block['code'].split()),
+                                "language": block.get('language', ''),
+                                "type": block.get('type', 'code_block'),
+                                "extraction_method": "llm"
                             }
                             code_metadatas.append(code_meta)
                         
@@ -768,7 +748,7 @@ if FIRECRAWL_AVAILABLE:
                 extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
                 code_blocks = []
                 if extract_code_examples:
-                    code_blocks = extract_code_blocks(markdown_content, min_length=25)
+                    code_blocks = extract_code_blocks_with_llm(markdown_content, url)
                     if code_blocks:
                         code_urls = []
                         code_chunk_numbers = []
@@ -776,21 +756,12 @@ if FIRECRAWL_AVAILABLE:
                         code_summaries = []
                         code_metadatas = []
                         
-                        # Process code examples in parallel
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                            # Prepare arguments for parallel processing
-                            summary_args = [(block['code'], block['context_before'], block['context_after']) 
-                                            for block in code_blocks]
-                            
-                            # Generate summaries in parallel
-                            summaries = list(executor.map(process_code_example, summary_args))
-                        
-                        # Prepare code example data
-                        for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                        # Prepare code example data - LLM already provides summaries
+                        for i, block in enumerate(code_blocks):
                             code_urls.append(url)
                             code_chunk_numbers.append(i)
                             code_examples.append(block['code'])
-                            code_summaries.append(summary)
+                            code_summaries.append(block.get('summary', f"{block.get('language', 'code')} example"))
                             
                             # Create metadata for code example
                             code_meta = {
@@ -799,7 +770,10 @@ if FIRECRAWL_AVAILABLE:
                                 "source": source_id,
                                 "char_count": len(block['code']),
                                 "word_count": len(block['code'].split()),
-                                "crawl_method": "firecrawl"
+                                "crawl_method": "firecrawl",
+                                "language": block.get('language', ''),
+                                "type": block.get('type', 'code_block'),
+                                "extraction_method": "llm"
                             }
                             code_metadatas.append(code_meta)
                         
@@ -976,27 +950,18 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             for doc in crawl_results:
                 source_url = doc['url']
                 md = doc['markdown']
-                code_blocks = extract_code_blocks(md, min_length=25)
+                code_blocks = extract_code_blocks_with_llm(md, source_url)
                 
                 if code_blocks:
-                    # Process code examples in parallel
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        # Prepare arguments for parallel processing
-                        summary_args = [(block['code'], block['context_before'], block['context_after']) 
-                                        for block in code_blocks]
-                        
-                        # Generate summaries in parallel
-                        summaries = list(executor.map(process_code_example, summary_args))
-                    
-                    # Prepare code example data
+                    # Prepare code example data - LLM already provides summaries
                     parsed_url = urlparse(source_url)
                     source_id = parsed_url.netloc or parsed_url.path
                     
-                    for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                    for i, block in enumerate(code_blocks):
                         code_urls.append(source_url)
                         code_chunk_numbers.append(len(code_examples))  # Use global code example index
                         code_examples.append(block['code'])
-                        code_summaries.append(summary)
+                        code_summaries.append(block.get('summary', f"{block.get('language', 'code')} example"))
                         
                         # Create metadata for code example
                         code_meta = {
@@ -1004,7 +969,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                             "url": source_url,
                             "source": source_id,
                             "char_count": len(block['code']),
-                            "word_count": len(block['code'].split())
+                            "word_count": len(block['code'].split()),
+                            "language": block.get('language', ''),
+                            "type": block.get('type', 'code_block'),
+                            "extraction_method": "llm"
                         }
                         code_metadatas.append(code_meta)
             

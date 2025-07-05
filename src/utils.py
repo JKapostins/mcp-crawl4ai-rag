@@ -736,3 +736,124 @@ def search_code_examples(
     except Exception as e:
         print(f"Error searching code examples: {e}")
         return []
+
+
+def extract_code_blocks_with_llm(markdown_content: str, url: str = "") -> List[Dict[str, Any]]:
+    """
+    Extract code blocks from markdown content using an LLM for intelligent parsing.
+    
+    This function uses OpenAI's API to identify and extract code blocks with better
+    context understanding than regex-based approaches.
+    
+    Args:
+        markdown_content: The markdown content to extract code blocks from
+        url: Source URL for context (optional)
+        
+    Returns:
+        List of dictionaries containing code blocks and their context
+    """
+    # Check if OpenAI API is available
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("Warning: No OpenAI API key found, falling back to regex-based extraction")
+        return extract_code_blocks(markdown_content, min_length=25)
+    
+    try:
+        # Initialize OpenAI client
+        client = openai.OpenAI(api_key=api_key)
+        model = os.getenv("MODEL_CHOICE", "gpt-4o-mini")
+        
+        system_prompt = """You are an expert code extraction specialist. Your task is to identify and extract ALL code blocks from markdown content, including:
+
+1. Code blocks wrapped in triple backticks (```language)
+2. Inline code snippets that represent meaningful examples
+3. Configuration files, JSON, YAML, XML blocks
+4. Command-line examples and shell scripts
+5. API requests/responses and curl commands
+6. Code fragments that might be poorly formatted
+
+For each code block found, provide:
+- The actual code content (cleaned and formatted)
+- Programming language or type (e.g., javascript, python, bash, json, etc.)
+- A descriptive summary of what the code does
+- Context about how it's used (from surrounding text)
+
+Return your response as a JSON array with this structure:
+[
+  {
+    "code": "actual code content here",
+    "language": "programming language or type",
+    "summary": "brief description of what this code does",
+    "context": "surrounding context explaining usage",
+    "type": "code_block|inline_code|config|command|api_example"
+  }
+]
+
+If no code blocks are found, return an empty array: []
+
+Be thorough - even small code snippets can be valuable for documentation."""
+
+        user_prompt = f"""Extract all code blocks from this markdown content{f' from {url}' if url else ''}:
+
+{markdown_content}
+
+Please identify and extract ALL code examples, configuration snippets, command-line examples, and API calls."""
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=4000
+        )
+        
+        # Parse the response
+        response_content = response.choices[0].message.content.strip()
+        
+        # Try to extract JSON from the response
+        try:
+            # Look for JSON array in the response
+            import json
+            # Try to parse as JSON directly
+            if response_content.startswith('[') and response_content.endswith(']'):
+                code_blocks = json.loads(response_content)
+            else:
+                # Try to find JSON within the response
+                import re
+                json_match = re.search(r'\[.*\]', response_content, re.DOTALL)
+                if json_match:
+                    code_blocks = json.loads(json_match.group())
+                else:
+                    print("No JSON array found in LLM response")
+                    return []
+            
+            # Validate and format the results
+            formatted_blocks = []
+            for block in code_blocks:
+                if isinstance(block, dict) and 'code' in block:
+                    formatted_block = {
+                        'code': block.get('code', ''),
+                        'language': block.get('language', ''),
+                        'summary': block.get('summary', ''),
+                        'context_before': block.get('context', ''),
+                        'context_after': '',
+                        'full_context': block.get('context', ''),
+                        'type': block.get('type', 'code_block')
+                    }
+                    formatted_blocks.append(formatted_block)
+            
+            print(f"LLM extracted {len(formatted_blocks)} code blocks")
+            return formatted_blocks
+            
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse LLM response as JSON: {e}")
+            print(f"Response was: {response_content[:500]}...")
+            return []
+            
+    except Exception as e:
+        print(f"Error with LLM code extraction: {e}")
+        # Fall back to regex-based extraction
+        print("Falling back to regex-based extraction")
+        return extract_code_blocks(markdown_content, min_length=25)
