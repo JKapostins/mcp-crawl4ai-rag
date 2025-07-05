@@ -816,7 +816,7 @@ if FIRECRAWL_AVAILABLE:
             }, indent=2)
 
     @mcp.tool()
-    async def crawl_website(
+    async def crawl_web(
         ctx: Context,
         url: str,
         limit: int = 100,
@@ -832,9 +832,9 @@ if FIRECRAWL_AVAILABLE:
         poll_interval: int = 30
     ) -> str:
         """
-        Crawl an entire website using Firecrawl and store all content in Supabase.
+        Crawl web pages starting from a URL using Firecrawl and store all content in Supabase.
         
-        This tool uses Firecrawl to crawl multiple pages from a website, with support for
+        This tool uses Firecrawl to crawl multiple pages from a starting URL, with support for
         both synchronous and asynchronous crawling. All crawled content is automatically 
         cleaned and optimized for RAG using an LLM when USE_AGENTIC_RAG environment 
         variable is set to "true".
