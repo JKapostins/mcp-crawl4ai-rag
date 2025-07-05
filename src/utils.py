@@ -313,6 +313,9 @@ def add_documents_to_supabase(
                     
                     if successful_inserts > 0:
                         print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+                    else:
+                        # If no records were inserted at all, raise an exception
+                        raise Exception(f"Failed to insert any records after {max_retries} attempts and individual retries")
 
 def search_documents(
     client: Client, 
@@ -591,6 +594,9 @@ def add_code_examples_to_supabase(
                     
                     if successful_inserts > 0:
                         print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+                    else:
+                        # If no records were inserted at all, raise an exception
+                        raise Exception(f"Failed to insert any records after {max_retries} attempts and individual retries")
         print(f"Inserted batch {i//batch_size + 1} of {(total_items + batch_size - 1)//batch_size} code examples")
 
 
@@ -765,7 +771,7 @@ def extract_code_blocks_with_llm(markdown_content: str, url: str = "") -> List[D
         
         system_prompt = """You are an expert code extraction specialist. Your task is to identify and extract ALL code blocks from markdown content, including:
 
-1. Code blocks wrapped in triple backticks (```language)
+1. Code blocks wrapped in triple backticks (```language {USUALLY SEVERAL LINES OF CODE} ```)
 2. Inline code snippets that represent meaningful examples
 3. Configuration files, JSON, YAML, XML blocks
 4. Command-line examples and shell scripts
