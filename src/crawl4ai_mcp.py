@@ -616,7 +616,7 @@ if not FIRECRAWL_AVAILABLE:
 # Firecrawl version of crawl_single_page
 if FIRECRAWL_AVAILABLE:
     @mcp.tool()
-    async def crawl_single_page(
+    async def scrape_single_page(
         ctx: Context,
         url: str,
         format: str = "markdown",
