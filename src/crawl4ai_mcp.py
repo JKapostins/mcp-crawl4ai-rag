@@ -50,7 +50,10 @@ from utils import (
     add_code_examples_to_supabase,
     update_source_info,
     extract_source_summary,
-    search_code_examples
+    search_code_examples,
+    chunk_document_single,
+    chunk_document_llm,
+    smart_chunk_markdown
 )
 
 # Import knowledge graph modules
@@ -412,50 +415,6 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
 
     return urls
 
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
-    """Split text into chunks, respecting code blocks and paragraphs."""
-    chunks = []
-    start = 0
-    text_length = len(text)
-
-    while start < text_length:
-        # Calculate end position
-        end = start + chunk_size
-
-        # If we're at the end of the text, just take what's left
-        if end >= text_length:
-            chunks.append(text[start:].strip())
-            break
-
-        # Try to find a code block boundary first (```)
-        chunk = text[start:end]
-        code_block = chunk.rfind('```')
-        if code_block != -1 and code_block > chunk_size * 0.3:
-            end = start + code_block
-
-        # If no code block, try to break at a paragraph
-        elif '\n\n' in chunk:
-            # Find the last paragraph break
-            last_break = chunk.rfind('\n\n')
-            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_break
-
-        # If no paragraph break, try to break at a sentence
-        elif '. ' in chunk:
-            # Find the last sentence break
-            last_period = chunk.rfind('. ')
-            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_period + 1
-
-        # Extract chunk and clean it up
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        # Move start position for next chunk
-        start = end
-
-    return chunks
 
 def extract_section_info(chunk: str) -> Dict[str, Any]:
     """
@@ -626,7 +585,11 @@ if FIRECRAWL_AVAILABLE:
         include_tags: Optional[List[str]] = None,
         exclude_tags: Optional[List[str]] = None,
         wait_for: int = 1000,
-        timeout: int = 15000
+        timeout: int = 15000,
+        # Chunking Options
+        chunking_strategy: str = "character",
+        chunk_size: int = 5000,
+        chunking_prompt: Optional[str] = None
     ) -> str:
         """
         Crawl a single web page using Firecrawl and store its content in Supabase.
@@ -647,6 +610,14 @@ if FIRECRAWL_AVAILABLE:
             exclude_tags: List of HTML tags/selectors to exclude (e.g., ["#ad", "#footer"])
             wait_for: Time to wait after page load in milliseconds (default: 1000)
             timeout: Maximum time to wait for page load in milliseconds (default: 15000)
+            
+            # Chunking Options:
+            chunking_strategy: Strategy for chunking content - "character" (default), "document", or "llm"
+                - "character": Smart character-based chunking with configurable size (respects code blocks/paragraphs)
+                - "document": Store entire document as single chunk (useful for known document types)
+                - "llm": Use LLM to intelligently determine chunk boundaries based on content structure
+            chunk_size: For character strategy - maximum characters per chunk (default: 5000)
+            chunking_prompt: For LLM strategy - custom prompt to guide chunking decisions (optional)
         
         Returns:
             Summary of the crawling operation and storage in Supabase
@@ -702,10 +673,16 @@ if FIRECRAWL_AVAILABLE:
                 parsed_url = urlparse(url)
                 source_id = parsed_url.netloc or parsed_url.path
                 
-                # Note: smart_chunk_markdown and extract_section_info are defined in this file
-                
-                # Chunk the content
-                chunks = smart_chunk_markdown(markdown_content)
+                # Chunk the content using the specified strategy
+                if chunking_strategy == "document":
+                    chunks = chunk_document_single(markdown_content)
+                    print(f"Using document chunking strategy: {len(chunks)} chunk(s)")
+                elif chunking_strategy == "llm":
+                    chunks = chunk_document_llm(markdown_content, chunking_prompt, url)
+                    print(f"Using LLM chunking strategy: {len(chunks)} chunk(s)")
+                else:  # Default to "character" strategy
+                    chunks = smart_chunk_markdown(markdown_content, chunk_size)
+                    print(f"Using character chunking strategy (size: {chunk_size}): {len(chunks)} chunk(s)")
                 
                 # Prepare data for Supabase
                 urls = []
@@ -800,7 +777,10 @@ if FIRECRAWL_AVAILABLE:
                     "agent_used": agent_prompt is not None,
                     "agent_model": agent_model if agent_prompt else None,
                     "llm_cleaned": use_agentic_rag and OPENAI_AVAILABLE,
-                    "format": format
+                    "format": format,
+                    "chunking_strategy": chunking_strategy,
+                    "chunk_size": chunk_size if chunking_strategy == "character" else None,
+                    "chunking_prompt_used": chunking_prompt is not None if chunking_strategy == "llm" else None
                 }, indent=2)
             else:
                 return json.dumps({
@@ -840,7 +820,10 @@ if FIRECRAWL_AVAILABLE:
         wait_for: int = 2000,
         timeout: int = 15000,
         # Storage Options
-        chunk_size: int = 5000
+        chunk_size: int = 5000,
+        # Chunking Options
+        chunking_strategy: str = "character",
+        chunking_prompt: Optional[str] = None
     ) -> str:
         """
         Synchronously crawl multiple web pages using Firecrawl and store content in Supabase.
@@ -875,6 +858,13 @@ if FIRECRAWL_AVAILABLE:
             
             # STORAGE OPTIONS:
             chunk_size: Maximum size in characters for each content chunk stored in database. Smaller chunks = more granular search, larger chunks = more context per result (default: 5000)
+            
+            # CHUNKING OPTIONS:
+            chunking_strategy: Strategy for chunking content - "character" (default), "document", or "llm"
+                - "character": Smart character-based chunking with configurable size (respects code blocks/paragraphs)
+                - "document": Store entire document as single chunk (useful for known document types)
+                - "llm": Use LLM to intelligently determine chunk boundaries based on content structure
+            chunking_prompt: For LLM strategy - custom prompt to guide chunking decisions (optional)
         
         Returns:
             JSON string with detailed crawl summary including: success status, pages crawled, failed pages, total content chunks stored, code blocks found, list of crawled URLs, and all parameters used
@@ -1022,8 +1012,13 @@ if FIRECRAWL_AVAILABLE:
                                 parsed_url = urlparse(page_url)
                                 source_id = parsed_url.netloc or parsed_url.path
                                 
-                                # Chunk the content
-                                chunks = smart_chunk_markdown(markdown_content, chunk_size=chunk_size)
+                                # Chunk the content using the specified strategy
+                                if chunking_strategy == "document":
+                                    chunks = chunk_document_single(markdown_content)
+                                elif chunking_strategy == "llm":
+                                    chunks = chunk_document_llm(markdown_content, chunking_prompt, page_url)
+                                else:  # Default to "character" strategy
+                                    chunks = smart_chunk_markdown(markdown_content, chunk_size=chunk_size)
                                 
                                 # Prepare data for Supabase
                                 urls = []
@@ -1140,7 +1135,10 @@ if FIRECRAWL_AVAILABLE:
         wait_for: int = 2000,
         timeout: int = 15000,
         # Storage Options
-        chunk_size: int = 5000
+        chunk_size: int = 5000,
+        # Chunking Options
+        chunking_strategy: str = "character",
+        chunking_prompt: Optional[str] = None
     ) -> str:
         """
         Asynchronously crawl multiple web pages using Firecrawl and return job information.
@@ -1175,6 +1173,13 @@ if FIRECRAWL_AVAILABLE:
             
             # STORAGE OPTIONS:
             chunk_size: Maximum size in characters for each content chunk stored in database. Smaller chunks = more granular search, larger chunks = more context per result (default: 5000)
+            
+            # CHUNKING OPTIONS:
+            chunking_strategy: Strategy for chunking content - "character" (default), "document", or "llm"
+                - "character": Smart character-based chunking with configurable size (respects code blocks/paragraphs)
+                - "document": Store entire document as single chunk (useful for known document types)
+                - "llm": Use LLM to intelligently determine chunk boundaries based on content structure
+            chunking_prompt: For LLM strategy - custom prompt to guide chunking decisions (optional)
         
         Returns:
             JSON string with async job information including: job ID for status checking, crawl parameters used, and note about retrieving results when completed
@@ -1266,6 +1271,11 @@ if FIRECRAWL_AVAILABLE:
                             "exclude_tags": exclude_tags,
                             "wait_for": wait_for,
                             "timeout": timeout
+                        },
+                        "chunking_options": {
+                            "chunking_strategy": chunking_strategy,
+                            "chunk_size": chunk_size,
+                            "chunking_prompt": chunking_prompt
                         }
                     },
                     "note": "Use the job_id to check crawl status and retrieve results when completed"
@@ -1359,7 +1369,13 @@ if not FIRECRAWL_AVAILABLE:
             for doc in crawl_results:
                 source_url = doc['url']
                 md = doc['markdown']
-                chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+                # Chunk the content using the specified strategy
+                if chunking_strategy == "document":
+                    chunks = chunk_document_single(md)
+                elif chunking_strategy == "llm":
+                    chunks = chunk_document_llm(md, chunking_prompt, source_url)
+                else:  # Default to "character" strategy
+                    chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
                 
                 # Extract source_id
                 parsed_url = urlparse(source_url)
@@ -1467,7 +1483,10 @@ if not FIRECRAWL_AVAILABLE:
                 "chunks_stored": chunk_count,
                 "code_examples_stored": len(code_examples),
                 "sources_updated": len(source_content_map),
-                "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
+                "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else []),
+                "chunking_strategy": chunking_strategy,
+                "chunk_size": chunk_size if chunking_strategy == "character" else None,
+                "chunking_prompt_used": chunking_prompt is not None if chunking_strategy == "llm" else None
             }, indent=2)
         except Exception as e:
             return json.dumps({
