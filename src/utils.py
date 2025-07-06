@@ -863,3 +863,218 @@ Please identify and extract ALL code examples, configuration snippets, command-l
         # Fall back to regex-based extraction
         print("Falling back to regex-based extraction")
         return extract_code_blocks(markdown_content, min_length=25)
+
+
+def chunk_document_single(markdown_content: str) -> List[str]:
+    """
+    Store the entire document as a single chunk.
+    
+    Args:
+        markdown_content: The markdown content to chunk
+        
+    Returns:
+        List containing a single chunk with the entire document
+    """
+    return [markdown_content.strip()] if markdown_content.strip() else []
+
+
+def chunk_document_llm(markdown_content: str, chunking_prompt: Optional[str] = None, url: str = "") -> List[str]:
+    """
+    Use an LLM to intelligently determine chunk boundaries based on content structure.
+    
+    Args:
+        markdown_content: The markdown content to chunk
+        chunking_prompt: Optional custom prompt for chunking strategy
+        url: Source URL for context (optional)
+        
+    Returns:
+        List of chunks determined by the LLM
+    """
+    # Check if OpenAI API is available
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("Warning: No OpenAI API key found, falling back to character-based chunking")
+        return smart_chunk_markdown(markdown_content)
+    
+    try:
+        # Initialize OpenAI client
+        client = openai.OpenAI(api_key=api_key)
+        model = os.getenv("MODEL_CHOICE", "gpt-4o-mini")
+        
+        # Default chunking prompt
+        default_prompt = """You are an expert content strategist specializing in document chunking for RAG (Retrieval-Augmented Generation) systems.
+
+Your task is to analyze the provided markdown document and determine optimal chunk boundaries that:
+1. Preserve semantic coherence - related content stays together
+2. Respect document structure - don't break in the middle of code blocks, tables, or lists
+3. Create meaningful, self-contained sections that can be understood independently
+4. Optimize for information retrieval - each chunk should cover a distinct topic or concept
+
+Guidelines for chunking:
+- Keep related concepts together (e.g., a function definition with its explanation)
+- Break at natural boundaries like headings, section breaks, or topic transitions
+- Ensure each chunk is substantial enough to be meaningful (aim for 1000-8000 characters)
+- Don't split code blocks, tables, or lists across chunks
+- Include relevant context in each chunk (e.g., heading/section title)
+
+Return your response as a JSON array of objects with this structure:
+[
+  {
+    "chunk_number": 1,
+    "title": "Brief descriptive title for this chunk",
+    "start_marker": "First few words or unique text to identify chunk start",
+    "end_marker": "Last few words or unique text to identify chunk end", 
+    "reasoning": "Brief explanation of why this is a logical chunk boundary"
+  }
+]
+
+Be thorough but don't over-chunk. Aim for 3-10 chunks for most documents."""
+
+        # Use custom prompt if provided, otherwise use default
+        system_prompt = chunking_prompt if chunking_prompt else default_prompt
+        
+        user_prompt = f"""Analyze this markdown document{f' from {url}' if url else ''} and determine optimal chunk boundaries:
+
+{markdown_content}
+
+Please provide a JSON array defining the chunk boundaries for this document."""
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=2000
+        )
+        
+        # Parse the response
+        response_content = response.choices[0].message.content.strip()
+        
+        # Try to extract JSON from the response
+        try:
+            import json
+            # Try to parse as JSON directly
+            if response_content.startswith('[') and response_content.endswith(']'):
+                chunk_definitions = json.loads(response_content)
+            else:
+                # Try to find JSON within the response
+                import re
+                json_match = re.search(r'\[.*\]', response_content, re.DOTALL)
+                if json_match:
+                    chunk_definitions = json.loads(json_match.group())
+                else:
+                    print("No JSON array found in LLM chunking response")
+                    return smart_chunk_markdown(markdown_content)
+            
+            # Extract chunks based on LLM-defined boundaries
+            chunks = []
+            content_length = len(markdown_content)
+            
+            for i, chunk_def in enumerate(chunk_definitions):
+                try:
+                    start_marker = chunk_def.get('start_marker', '')
+                    end_marker = chunk_def.get('end_marker', '')
+                    
+                    # Find start position
+                    if i == 0:
+                        start_pos = 0
+                    else:
+                        start_pos = markdown_content.find(start_marker)
+                        if start_pos == -1:
+                            # If marker not found, use end of previous chunk
+                            start_pos = sum(len(chunk) for chunk in chunks)
+                    
+                    # Find end position
+                    if i == len(chunk_definitions) - 1:
+                        end_pos = content_length
+                    else:
+                        end_pos = markdown_content.find(end_marker)
+                        if end_pos != -1:
+                            # Include the end marker in this chunk
+                            end_pos += len(end_marker)
+                        else:
+                            # If end marker not found, estimate based on content length
+                            remaining_chunks = len(chunk_definitions) - i
+                            remaining_content = content_length - start_pos
+                            chunk_size = remaining_content // remaining_chunks
+                            end_pos = start_pos + chunk_size
+                    
+                    # Extract chunk
+                    chunk_content = markdown_content[start_pos:end_pos].strip()
+                    
+                    if chunk_content:
+                        chunks.append(chunk_content)
+                        print(f"LLM Chunk {i+1}: {chunk_def.get('title', 'Untitled')} ({len(chunk_content)} chars)")
+                    
+                except Exception as chunk_error:
+                    print(f"Error processing chunk {i}: {chunk_error}")
+                    continue
+            
+            if not chunks:
+                print("No chunks extracted by LLM, falling back to character-based chunking")
+                return smart_chunk_markdown(markdown_content)
+            
+            print(f"LLM successfully created {len(chunks)} chunks")
+            return chunks
+            
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse LLM chunking response as JSON: {e}")
+            print(f"Response was: {response_content[:500]}...")
+            return smart_chunk_markdown(markdown_content)
+            
+    except Exception as e:
+        print(f"Error with LLM chunking: {e}")
+        # Fall back to character-based chunking
+        print("Falling back to character-based chunking")
+        return smart_chunk_markdown(markdown_content)
+
+
+def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
+    """
+    Character-based smart chunking that respects code blocks and paragraphs.
+    This is the original chunking strategy moved from crawl4ai_mcp.py for consistency.
+    """
+    chunks = []
+    start = 0
+    text_length = len(text)
+
+    while start < text_length:
+        # Calculate end position
+        end = start + chunk_size
+
+        # If we're at the end of the text, just take what's left
+        if end >= text_length:
+            chunks.append(text[start:].strip())
+            break
+
+        # Try to find a code block boundary first (```)
+        chunk = text[start:end]
+        code_block = chunk.rfind('```')
+        if code_block != -1 and code_block > chunk_size * 0.3:
+            end = start + code_block
+
+        # If no code block, try to break at a paragraph
+        elif '\n\n' in chunk:
+            # Find the last paragraph break
+            last_break = chunk.rfind('\n\n')
+            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+                end = start + last_break
+
+        # If no paragraph break, try to break at a sentence
+        elif '. ' in chunk:
+            # Find the last sentence break
+            last_period = chunk.rfind('. ')
+            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+                end = start + last_period + 1
+
+        # Extract chunk and clean it up
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        # Move start position for next chunk
+        start = end
+
+    return chunks
