@@ -572,6 +572,69 @@ if not FIRECRAWL_AVAILABLE:
                 "error": str(e)
             }, indent=2)
 
+@mcp.tool()
+async def process_local_markdown(
+    ctx: Context,
+    file_path: str,
+    # Processing Options
+    chunking_strategy: str = "character",
+    chunk_size: int = 5000,
+    chunking_prompt: Optional[str] = None,
+    title: Optional[str] = None,
+    source_name: Optional[str] = None
+) -> str:
+    """
+    Process local markdown files for RAG using the same smart agentic methods as scrape_single_page.
+    
+    This tool reads local markdown files and processes them using LLM-based code block detection,
+    content optimization, and flexible chunking strategies. Content is cleaned and optimized
+    for RAG when USE_AGENTIC_RAG is enabled.
+    
+    Args:
+        ctx: The MCP server provided context
+        file_path: Path to the local markdown file to process
+        
+        # CHUNKING OPTIONS:
+        chunking_strategy: Strategy for chunking content - "character" (default), "document", or "llm"
+            - "character": Smart character-based chunking with configurable size (respects code blocks/paragraphs)
+            - "document": Store entire document as single chunk (useful for known document types)
+            - "llm": Use LLM to intelligently determine chunk boundaries based on content structure
+        chunk_size: For character strategy - maximum characters per chunk (default: 5000)
+        chunking_prompt: For LLM strategy - custom prompt to guide chunking decisions (optional)
+        title: Optional title for the document (defaults to filename if not provided)
+        source_name: Optional source name for organization (defaults to file_path if not provided)
+    
+    Returns:
+        JSON string with processing summary including: success status, file processed, 
+        content chunks stored, code blocks found, and processing parameters used
+    """
+    try:
+        # Get Supabase client from MCP context
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        # Import and call the standalone function - single source of truth!
+        from markdown_processor import process_local_markdown_standalone
+        
+        result = await process_local_markdown_standalone(
+            file_path=file_path,
+            chunking_strategy=chunking_strategy,
+            chunk_size=chunk_size,
+            chunking_prompt=chunking_prompt,
+            title=title,
+            source_name=source_name,
+            supabase_client=supabase_client
+        )
+        
+        return result
+        
+    except Exception as e:
+        import json
+        return json.dumps({
+            "success": False,
+            "file_path": file_path,
+            "error": f"MCP tool error: {str(e)}"
+        }, indent=2)
+
 # Firecrawl version of crawl_single_page
 if FIRECRAWL_AVAILABLE:
     @mcp.tool()

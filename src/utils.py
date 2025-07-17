@@ -346,9 +346,15 @@ def search_documents(
             'match_count': match_count
         }
         
-        # Only add the filter if it's actually provided and not empty
+        # Handle source filtering properly
         if filter_metadata:
-            params['filter'] = filter_metadata  # Pass the dictionary directly, not JSON-encoded
+            # Check if this is a source filter (common case from MCP tool)
+            if 'source' in filter_metadata and len(filter_metadata) == 1:
+                # Use source_filter parameter for better performance
+                params['source_filter'] = filter_metadata['source']
+            else:
+                # Use metadata filter for other cases
+                params['filter'] = filter_metadata
         
         result = client.rpc('match_crawled_pages', params).execute()
         
